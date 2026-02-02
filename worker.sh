@@ -8,7 +8,7 @@ fi
 
 JOIN_CMD="$@"
 
-echo "[WORKER] Resetting node (safe even if fresh)"
+echo "[WORKER] Resetting node"
 sudo kubeadm reset -f || true
 sudo rm -rf /etc/cni/net.d ~/.kube || true
 sudo systemctl restart kubelet

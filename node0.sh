@@ -15,9 +15,9 @@ mkdir -p $HOME/.kube
 sudo cp /etc/kubernetes/admin.conf $HOME/.kube/config
 sudo chown $(id -u):$(id -g) $HOME/.kube/config
 
-echo "[MASTER] Saving join command"
+echo "[MASTER] Generating join command"
 kubeadm token create --print-join-command > join.sh
 chmod +x join.sh
 
 echo "[MASTER] Control plane initialized"
-echo "[MASTER] Run ./join.sh on worker nodes"
+echo "[MASTER] Run the join command in join.sh on worker nodes"
