@@ -5,7 +5,7 @@ set -euo pipefail
 # This script automates the build and deployment of OVN-Kubernetes CNI
 
 OVN_REPO="git@github.com:Anirudh-R-1201/ovn-kubernetes.git"
-OVN_BRANCH="${OVN_BRANCH:-master}"
+OVN_BRANCH="${OVN_BRANCH:-nw-affinity}"
 OVN_DIR="${HOME}/ovn-kubernetes"
 GO_VERSION="1.21.7"
 POD_CIDR="10.128.0.0/14"
@@ -20,14 +20,34 @@ echo "Pod CIDR: ${POD_CIDR}"
 echo "Service CIDR: ${SVC_CIDR}"
 echo "=========================================="
 
+# Check Docker permissions
+echo "[0/6] Checking Docker permissions..."
+if ! docker ps >/dev/null 2>&1; then
+  echo "Warning: Cannot access Docker daemon without sudo."
+  echo "Attempting to fix by activating docker group membership..."
+  
+  if groups | grep -q docker; then
+    echo "You are in the docker group but need to activate it."
+    echo "Executing the rest of this script with correct permissions..."
+    # Re-execute this script with newgrp to activate docker group
+    exec sg docker "$0 $@"
+  else
+    echo "ERROR: You are not in the docker group."
+    echo "Please run: sudo usermod -aG docker \$USER"
+    echo "Then log out and log back in, or run: newgrp docker"
+    exit 1
+  fi
+fi
+echo "Docker permissions OK"
+
 # Step 1: Clone OVN-Kubernetes repository
 if [ ! -d "${OVN_DIR}" ]; then
-  echo "[1/7] Cloning OVN-Kubernetes repository..."
+  echo "[1/6] Cloning OVN-Kubernetes repository..."
   git clone "${OVN_REPO}" "${OVN_DIR}"
   cd "${OVN_DIR}"
   git checkout "${OVN_BRANCH}"
 else
-  echo "[1/7] OVN-Kubernetes repository already exists, pulling latest..."
+  echo "[1/6] OVN-Kubernetes repository already exists, pulling latest..."
   cd "${OVN_DIR}"
   git fetch origin
   git checkout "${OVN_BRANCH}"
@@ -36,7 +56,7 @@ fi
 
 # Step 2: Install Go if not present
 if ! command -v go >/dev/null 2>&1; then
-  echo "[2/7] Installing Go ${GO_VERSION}..."
+  echo "[2/6] Installing Go ${GO_VERSION}..."
   cd ~
   curl -LO "https://go.dev/dl/go${GO_VERSION}.linux-amd64.tar.gz"
   sudo tar -C /usr/local -xzf "go${GO_VERSION}.linux-amd64.tar.gz"
@@ -45,82 +65,42 @@ if ! command -v go >/dev/null 2>&1; then
   rm "go${GO_VERSION}.linux-amd64.tar.gz"
   go version
 else
-  echo "[2/7] Go already installed: $(go version)"
+  echo "[2/6] Go already installed: $(go version)"
 fi
 
 # Step 3: Build OVN-Kubernetes image
-echo "[3/7] Building OVN-Kubernetes Ubuntu image (this may take 10-15 minutes)..."
+echo "[3/6] Building OVN-Kubernetes Ubuntu image (this may take 10-15 minutes)..."
 cd "${OVN_DIR}/dist/images"
 make ubuntu-image
 
 # Step 4: Tag the image
-echo "[4/7] Tagging image as ovn-kube:latest..."
+echo "[4/6] Tagging image as ovn-kube:latest..."
 docker tag ovn-kube-ubuntu:latest ovn-kube:latest
 
-# Step 5: Distribute image to worker nodes
-echo "[5/7] Distributing image to worker nodes..."
+# Step 5: Save image for distribution
+echo "[5/6] Saving image for distribution to worker nodes..."
 cd ~
 docker save ovn-kube:latest | gzip > ovn-kube.tar.gz
 
-# Get list of worker nodes (excluding control plane)
-WORKER_NODES=$(kubectl get nodes --no-headers | grep -v "control-plane" | awk '{print $1}')
-
-if [ -z "${WORKER_NODES}" ]; then
-  echo "Warning: No worker nodes found. Skipping image distribution."
-else
-  for node in ${WORKER_NODES}; do
-    echo "  -> Copying image to ${node}..."
-    scp -o StrictHostKeyChecking=no ovn-kube.tar.gz "${node}:~/" || {
-      echo "    Warning: Failed to copy to ${node}. You may need to do this manually."
-    }
-    echo "  -> Loading image on ${node}..."
-    ssh -o StrictHostKeyChecking=no "${node}" "gunzip -c ~/ovn-kube.tar.gz | docker load" || {
-      echo "    Warning: Failed to load image on ${node}. You may need to do this manually."
-    }
-  done
-fi
-
-rm ovn-kube.tar.gz
-
-# Step 6: Generate OVN-Kubernetes manifest
-echo "[6/7] Generating OVN-Kubernetes manifest..."
-cd "${OVN_DIR}"
-./dist/images/daemonset.sh \
-  --image=ovn-kube:latest \
-  --net-cidr="${POD_CIDR}" \
-  --svc-cidr="${SVC_CIDR}" \
-  > ovn-kubernetes.yaml
-
-# Step 7: Deploy OVN-Kubernetes CNI
-echo "[7/7] Deploying OVN-Kubernetes CNI..."
-kubectl apply -f ovn-kubernetes.yaml
-
 echo ""
 echo "=========================================="
-echo "Installation complete!"
+echo "Image built and saved successfully!"
 echo "=========================================="
 echo ""
-echo "Waiting for OVN-Kubernetes pods to be ready..."
-echo "(This may take 2-3 minutes)"
+echo "Next steps for CloudLab clusters:"
 echo ""
-
-# Wait for pods to be ready
-kubectl wait --for=condition=ready pod -l app=ovnkube-node -n ovn-kubernetes --timeout=300s || {
-  echo "Warning: Some pods are not ready yet. Check status with:"
-  echo "  kubectl get pods -n ovn-kubernetes"
-}
-
+echo "Option A - Distribute via your local machine (RECOMMENDED for CloudLab):"
+echo "  1. From your laptop: scp node0:~/ovn-kube.tar.gz ."
+echo "  2. From your laptop: scp ovn-kube.tar.gz node1:~/"
+echo "  3. On node1: gunzip -c ~/ovn-kube.tar.gz | sudo docker load"
+echo "  4. Repeat for any additional worker nodes"
+echo "  5. Come back to node0 and run: ./deploy-ovn-cni.sh"
 echo ""
-echo "Checking node status..."
-kubectl get nodes -o wide
-
+echo "Option B - Set up SSH keys between nodes:"
+echo "  1. On each worker from your laptop:"
+echo "     ssh worker 'echo \"$(cat ~/.ssh/id_ed25519.pub)\" >> ~/.ssh/authorized_keys'"
+echo "  2. Test with: ssh node1 hostname"
+echo "  3. Then run: ./distribute-and-deploy-cni.sh"
 echo ""
-echo "Checking OVN-Kubernetes pods..."
-kubectl get pods -n ovn-kubernetes -o wide
-
-echo ""
-echo "=========================================="
-echo "Next steps:"
-echo "1. Verify all nodes are 'Ready'"
-echo "2. Deploy your workload"
+echo "Image file location: ~/ovn-kube.tar.gz"
 echo "=========================================="

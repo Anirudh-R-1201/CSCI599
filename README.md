@@ -17,13 +17,21 @@ branch).
 
 CSCI599/
 
-├── [all.sh](http://all.sh)      # AUTOMATED: Common setup (containerd, Docker, Kubernetes v1.29, networking)
+├── all.sh              # AUTOMATED: Common setup (containerd, Docker, Kubernetes v1.29, networking)
 
-├── [node0.sh](http://node0.sh)    # AUTOMATED: Control-plane initialization with kubeadm
+├── node0.sh            # AUTOMATED: Control-plane initialization with kubeadm
 
-├── [worker.sh](http://worker.sh)   # AUTOMATED: Worker node join script
+├── worker.sh                     # AUTOMATED: Worker node join script
 
-├── [README.md](http://README.md)   # This document
+├── install-ovn-cni.sh            # Build OVN-Kubernetes image (run on node0)
+
+├── distribute-and-deploy-cni.sh  # Distribute image & deploy CNI (if SSH configured)
+
+├── deploy-ovn-cni.sh             # Deploy CNI only (after manual image distribution)
+
+├── distribute-image-from-local.sh # Helper script for image distribution (run on laptop)
+
+├── README.md                     # This document
 
 ```
 
@@ -65,11 +73,23 @@ chmod +x all.sh
 This script:
 - Installs and configures **containerd** (CRI for Kubernetes ≥1.24)  
 - Installs Docker (used for building OVN images)
+- Adds current user to docker group (for permission-less Docker access)
 - Installs Kubernetes v1.29 (kubelet, kubeadm, kubectl)
 - Configures kubelet to use containerd runtime
 - Applies required kernel and sysctl settings (persistent across reboots)
 - Disables swap (persistent across reboots)
 - Enables and starts kubelet service
+
+**⚠️ IMPORTANT:** After running this script, you need to activate Docker group membership:
+
+```bash
+# Option 1: Activate docker group in current session
+newgrp docker
+
+# Option 2: Log out and log back in (more reliable)
+```
+
+If you skip this step, the CNI installation script will handle it automatically.
 
 
 
@@ -100,7 +120,7 @@ This script:
 
 - Runs kubeadm init
 - Configures kubectl using admin.conf
-- Generates a worker join command in [join.sh](http://join.sh)
+- Generates a worker join command in join.sh
 
 
 
@@ -108,7 +128,7 @@ This script:
 
 > **Important:**
 
-> Always use the exact IP shown in [join.sh](http://join.sh) when joining workers.
+> Always use the exact IP shown in join.sh when joining workers.
 
 > This IP is embedded in the API server certificate.
 
@@ -126,7 +146,7 @@ This script:
 
 
 
-Copy the join command from node0/[join.sh](http://join.sh).
+Copy the join command from node0/join.sh.
 
 
 
@@ -167,15 +187,11 @@ This is expected until a CNI is installed.
 
 
 
-## 4. ✅ AUTOMATED - Install OVN-Kubernetes CNI (node0)
+## 4. Build OVN-Kubernetes CNI (node0)
 
-This single script automates all the following steps:
-- Cloning the custom OVN-Kubernetes repository from git@github.com:Anirudh-R-1201/ovn-kubernetes.git
-- Installing Go (if not present)
-- Building the OVN-Kubernetes Ubuntu image
-- Distributing the image to all worker nodes
-- Generating the CNI manifest with correct CIDRs
-- Deploying OVN-Kubernetes to the cluster
+The CNI installation is split into build and deployment phases to handle CloudLab's SSH restrictions.
+
+### Step 4a: Build the OVN Image
 
 On **node0**:
 
@@ -184,57 +200,166 @@ chmod +x install-ovn-cni.sh
 ./install-ovn-cni.sh
 ```
 
-**What this script does:**
+**What this does:**
+1. Checks Docker permissions and activates docker group if needed
+2. Clones the OVN-Kubernetes repository (nw-affinity branch)
+3. Installs Go 1.21.7 if needed
+4. Builds ovn-kube-ubuntu image (~10-15 minutes)
+5. Saves the image as `~/ovn-kube.tar.gz` for distribution
 
-1. Clones/updates the OVN-Kubernetes repository (nw-affinity branch)
-2. Installs Go 1.21.7 if not already present
-3. Builds the ovn-kube-ubuntu image (~10-15 minutes)
-4. Tags the image as ovn-kube:latest
-5. Distributes the image to all worker nodes via scp
-6. Generates the CNI manifest with pod CIDR (10.128.0.0/14) and service CIDR (172.30.0.0/16)
-7. Deploys OVN-Kubernetes to the cluster
-8. Waits for pods to be ready and verifies node status
+After the build completes, you'll see instructions for distributing the image.
+
+---
+
+## 5. Distribute OVN Image to Workers
+
+CloudLab nodes cannot SSH to each other by default. Choose one of these methods:
+
+### Method A: Via Your Local Machine (RECOMMENDED)
+
+This is the easiest method for CloudLab.
+
+**On your laptop:**
+
+```bash
+chmod +x distribute-image-from-local.sh
+
+# Edit the script to set your CloudLab hostnames
+# NODE0_HOST=anirudh1@ms0835.utah.cloudlab.us
+# NODE1_HOST=anirudh1@ms0844.utah.cloudlab.us
+
+./distribute-image-from-local.sh
+```
+
+This script:
+- Downloads the image from node0
+- Uploads it to all worker nodes
+- Loads the image into Docker on each worker
+
+### Method B: Set Up Inter-Node SSH (Optional)
+
+If you want nodes to communicate directly:
+
+**From your laptop, for each worker:**
+
+```bash
+# Get node0's public key
+ssh node0 cat ~/.ssh/id_ed25519.pub
+
+# Add it to each worker's authorized_keys
+ssh node1 "echo 'ssh-ed25519 AAAA...' >> ~/.ssh/authorized_keys"
+ssh node2 "echo 'ssh-ed25519 AAAA...' >> ~/.ssh/authorized_keys"
+```
+
+**Then on node0:**
+
+```bash
+chmod +x distribute-and-deploy-cni.sh
+./distribute-and-deploy-cni.sh
+```
+
+This script distributes the image AND deploys the CNI automatically.
+
+---
+
+## 6. Deploy the CNI (node0)
+
+After distributing the image using Method A above:
+
+**On node0:**
+
+```bash
+chmod +x deploy-ovn-cni.sh
+./deploy-ovn-cni.sh
+```
+
+This script:
+- Generates the OVN-Kubernetes manifest
+- Deploys it to the cluster
+- Waits for pods to be ready
+- Verifies node status
 
 **Expected output:**
 
-After completion, all nodes should show `Ready` status:
+**Verification:**
 
+Check OVN-Kubernetes pods (should all be Running):
+
+```bash
+kubectl get pods -n ovn-kubernetes -o wide
+```
+
+Check nodes (should all be Ready):
+
+```bash
+kubectl get nodes -o wide
+```
+
+Expected output:
 ```
 NAME     STATUS   ROLES           AGE   VERSION
 node0    Ready    control-plane   ...   v1.29.15
 node1    Ready    <none>          ...   v1.29.15
-node2    Ready    <none>          ...   v1.29.15
 ```
 
-And OVN-Kubernetes pods should be running:
+**Note:** It may take 1-2 minutes for nodes to transition from NotReady to Ready.
 
-```
+---
+
+## Troubleshooting
+
+### Nodes Still NotReady
+
+```bash
+# Check OVN pod status
 kubectl get pods -n ovn-kubernetes
+
+# View OVN logs
+kubectl logs -n ovn-kubernetes -l app=ovnkube-node --tail=50
+
+# On workers, verify image is loaded
+docker images | grep ovn-kube
 ```
 
-**Troubleshooting:**
+### ImagePullBackOff Errors
 
-If image distribution fails, you can manually copy the image to workers:
+Workers don't have the image. Distribute manually:
 
 ```bash
-# On node0
-docker save ovn-kube:latest | gzip > ovn-kube.tar.gz
+# From your laptop
+scp node0:~/ovn-kube.tar.gz .
 scp ovn-kube.tar.gz node1:~/
-scp ovn-kube.tar.gz node2:~/
 
-# On each worker
-gunzip -c ~/ovn-kube.tar.gz | docker load
+# On worker node
+gunzip -c ~/ovn-kube.tar.gz | sudo docker load
 ```
 
-**Customization:**
-
-You can customize the installation by setting environment variables:
+### CNI Not Deploying
 
 ```bash
-# Use a different branch
-OVN_BRANCH=main ./install-ovn-cni.sh
+# Check manifest exists
+ls -lh ~/ovn-kubernetes.yaml
 
-# Or edit the script to change Pod/Service CIDRs
+# Re-deploy
+kubectl delete -f ~/ovn-kubernetes.yaml  # if exists
+./deploy-ovn-cni.sh
+```
+
+---
+
+## Customization
+
+**Use different branch:**
+```bash
+OVN_BRANCH=master ./install-ovn-cni.sh
+```
+
+**Change Pod/Service CIDRs:**
+
+Edit the scripts and modify:
+```bash
+POD_CIDR="10.128.0.0/14"
+SVC_CIDR="172.30.0.0/16"
 ```
 
 

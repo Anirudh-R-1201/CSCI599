@@ -15,6 +15,9 @@ sudo apt install -y \
   curl \
   ca-certificates
 
+echo "[COMMON] Adding user to docker group"
+sudo usermod -aG docker $USER
+
 echo "[COMMON] Configuring containerd"
 sudo mkdir -p /etc/containerd
 sudo containerd config default | sudo tee /etc/containerd/config.toml >/dev/null
@@ -22,6 +25,8 @@ sudo sed -i 's/SystemdCgroup = false/SystemdCgroup = true/' /etc/containerd/conf
 
 sudo systemctl restart containerd
 sudo systemctl enable containerd
+sudo systemctl restart docker
+sudo systemctl enable docker
 
 echo "[COMMON] Preparing kubelet configuration for containerd"
 sudo mkdir -p /etc/systemd/system/kubelet.service.d
@@ -66,3 +71,9 @@ sudo systemctl enable kubelet
 sudo systemctl start kubelet
 
 echo "[COMMON] Done"
+echo ""
+echo "IMPORTANT: Docker group membership has been added."
+echo "To use Docker without sudo, you need to either:"
+echo "  1. Log out and log back in, OR"
+echo "  2. Run: newgrp docker"
+echo ""
