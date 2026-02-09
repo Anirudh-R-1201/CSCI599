@@ -41,8 +41,11 @@ We split the CNI installation into three phases:
 
 ### Phase 3: Deploy (on node0)
 **Script:** `deploy-ovn-cni.sh`
-- Installs `jinjanator` if needed (Python templating tool)
-- Generates OVN-Kubernetes manifests to `dist/yaml/`
+- Automatically installs `jinjanator` if needed (Python templating tool)
+- Ensures PATH includes `~/.local/bin` for jinjanate command
+- Verifies workers have the image in containerd
+- Generates OVN-Kubernetes manifests to `dist/yaml/` with proper directory context
+- Uses fallback approach if initial manifest generation fails
 - Deploys to cluster (core manifests)
 - Gracefully handles CRD validation errors (K8s version compatibility)
 - Waits for pods to be ready
@@ -104,6 +107,21 @@ kubectl get pods -n ovn-kubernetes
 - This is expected on CloudLab
 - Use Method A (laptop-based distribution)
 - Or set up SSH keys manually (see README)
+
+### Manifest Generation Fails
+- Error: `jinja2.exceptions.TemplateNotFound: ../templates/ovnkube-node.yaml.j2`
+- **Cause:** jinjanate can't find template files
+- **Fix:** The scripts now handle this automatically by:
+  - Installing jinjanator if missing
+  - Setting correct PATH
+  - Running from proper directory
+- If still failing, manually install: `pip3 install --user jinjanator`
+
+### No YAML files generated
+- Check if `~/ovn-kubernetes/dist/yaml/` is empty
+- The updated scripts verify manifest generation and use fallback approach
+- Manually verify: `ls -la ~/ovn-kubernetes/dist/yaml/`
+- Re-run: `./deploy-ovn-cni.sh`
 
 ### Nodes stay NotReady
 - Wait 2-3 minutes after deployment

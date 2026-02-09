@@ -278,13 +278,17 @@ chmod +x deploy-ovn-cni.sh
 ```
 
 This script:
-- Generates the OVN-Kubernetes manifests using `daemonset.sh`
+- Automatically installs `jinjanator` if not present (required for manifest generation)
+- Ensures the PATH includes `~/.local/bin` for jinjanate command
+- Verifies that workers have the image in containerd
+- Generates the OVN-Kubernetes manifests using `daemonset.sh` with proper working directory
 - Applies core OVN manifests (ovn-setup, ovnkube-db, ovnkube-master, ovnkube-node)
 - Gracefully handles CRD validation errors (K8s version compatibility)
 - Waits for pods to be ready
 - Verifies node status
 
-**Expected output:**
+**What happens:**
+The script will generate YAML manifests from Jinja2 templates and apply them to your cluster. If manifest generation fails, it will try an alternative approach using correct directory context.
 
 **Verification:**
 
@@ -360,6 +364,53 @@ kubectl delete -f ~/ovn-kubernetes/dist/yaml/ovnkube-node.yaml  # if exists
 ### CRD Validation Errors
 
 Some CRDs may fail to apply due to Kubernetes version compatibility (e.g., `userdefinednetworks.k8s.ovn.org` with CEL validation). This is **expected** and won't affect basic CNI functionality. The core OVN manifests will still deploy successfully.
+
+### Manifest Generation Fails (Template Not Found)
+
+If you see errors like `jinja2.exceptions.TemplateNotFound: ../templates/ovnkube-node.yaml.j2`:
+
+**Cause:** The jinjanate command can't find the Jinja2 template files.
+
+**Fix:**
+The `deploy-ovn-cni.sh` script now handles this automatically by:
+1. Installing jinjanator if missing
+2. Setting the correct PATH to include `~/.local/bin`
+3. Running daemonset.sh from the correct directory
+
+**Manual fix if needed:**
+```bash
+# Ensure jinjanator is installed
+pip3 install --user jinjanator
+
+# Add to PATH
+export PATH="${HOME}/.local/bin:${PATH}"
+
+# Verify installation
+jinjanate --version
+
+# Re-run deployment
+./deploy-ovn-cni.sh
+```
+
+### No Manifests in dist/yaml/
+
+If the `dist/yaml/` directory is empty after running deploy script:
+
+**Check:**
+```bash
+# Verify daemonset.sh exists
+ls -la ~/ovn-kubernetes/dist/images/daemonset.sh
+
+# Check for template files
+ls -la ~/ovn-kubernetes/dist/templates/
+
+# Try running manually from correct directory
+cd ~/ovn-kubernetes
+./dist/images/daemonset.sh --image=ovn-kube:latest \
+  --net-cidr=10.128.0.0/14 \
+  --svc-cidr=172.30.0.0/16 \
+  --kind=kind
+```
 
 ---
 

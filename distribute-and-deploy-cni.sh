@@ -70,17 +70,66 @@ if [ ! -d "${OVN_DIR}" ]; then
   exit 1
 fi
 
+# Ensure jinjanator is installed
+if ! command -v jinjanate &> /dev/null; then
+  echo "Installing jinjanator..."
+  pip3 install --user jinjanator
+  export PATH="${HOME}/.local/bin:${PATH}"
+fi
+
 echo "Generating OVN-Kubernetes manifests..."
 cd "${OVN_DIR}"
 
+# Check if daemonset.sh exists
+if [ ! -f "./dist/images/daemonset.sh" ]; then
+  echo "ERROR: daemonset.sh not found at ${OVN_DIR}/dist/images/daemonset.sh"
+  exit 1
+fi
+
+# Make sure we're using the correct PATH for jinjanate
+export PATH="${HOME}/.local/bin:${PATH}"
+
+# Get the Kubernetes API server address
+K8S_APISERVER="https://$(kubectl config view -o jsonpath='{.clusters[0].cluster.server}' | sed 's|https://||' | cut -d: -f1):6443"
+
 # daemonset.sh generates manifests to dist/yaml/ directory
+echo "Running daemonset.sh to generate manifests..."
 ./dist/images/daemonset.sh \
   --image=ovn-kube:latest \
   --net-cidr="${POD_CIDR}" \
   --svc-cidr="${SVC_CIDR}" \
-  --kind=kind
+  --gateway-mode="local" \
+  --k8s-apiserver="${K8S_APISERVER}" \
+  --kind=kind || {
+    echo "ERROR: Manifest generation failed"
+    echo "Trying alternative approach..."
+    
+    # Alternative: use pushd/popd to ensure correct directory context
+    pushd "${OVN_DIR}/dist/images" > /dev/null
+    ./daemonset.sh \
+      --image=ovn-kube:latest \
+      --net-cidr="${POD_CIDR}" \
+      --svc-cidr="${SVC_CIDR}" \
+      --gateway-mode="local" \
+      --k8s-apiserver="${K8S_APISERVER}" \
+      --kind=kind
+    popd > /dev/null
+  }
+
+# Verify manifests were generated
+if [ ! -f "${OVN_DIR}/dist/yaml/ovnkube-node.yaml" ]; then
+  echo "ERROR: Manifests were not generated in ${OVN_DIR}/dist/yaml/"
+  echo "Checking what files exist:"
+  ls -la "${OVN_DIR}/dist/yaml/" || echo "Directory does not exist"
+  exit 1
+fi
+
+echo "✓ Manifests generated successfully"
+echo ""
 
 echo "Applying CNI manifests..."
+cd "${OVN_DIR}"
+
 # Apply core OVN manifests (some CRDs may fail due to K8s version compatibility, that's OK)
 kubectl apply -f dist/yaml/ovn-setup.yaml 2>&1 | grep -v "unable to recognize" || true
 kubectl apply -f dist/yaml/ovnkube-db.yaml
