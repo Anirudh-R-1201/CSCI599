@@ -7,8 +7,8 @@ This document describes how to provision a multi-node Kubernetes cluster
 on CloudLab and deploy a custom OVN-Kubernetes CNI (from the `nw-affinity`
 branch). 
 
-**Automated Steps:** Kubernetes cluster setup (scripts provided)
-**Manual Steps:** OVN-Kubernetes CNI build and deployment (manual commands)
+**Automated Steps:** Kubernetes cluster setup and OVN-Kubernetes CNI deployment (scripts provided)
+**Manual Steps:** None - all steps are automated
 
 ---
 
@@ -34,11 +34,10 @@ CSCI599/
 - Kernel and network configuration
 - Kubernetes v1.29 cluster initialization  
 - Worker node joining
-
-**📋 MANUAL (Follow instructions below):**
-- Custom OVN-Kubernetes CNI build and deployment
+- Custom OVN-Kubernetes CNI build and deployment (from git@github.com:Anirudh-R-1201/ovn-kubernetes.git)
 - Go installation
-- Image building and distribution
+- Image building and distribution to all nodes
+- CNI manifest generation and deployment
 
 ---
 
@@ -168,143 +167,75 @@ This is expected until a CNI is installed.
 
 
 
-## 4. 📋 MANUAL - Clone Custom OVN-Kubernetes (node0)
+## 4. ✅ AUTOMATED - Install OVN-Kubernetes CNI (node0)
 
-
-
-
-
-On **node0**:
-
-```
-git clone https://github.com/Anirudh-R-1201/ovn-kubernetes.git
-cd ovn-kubernetes
-git checkout nw-affinity
-```
-
-
-
----
-
-
-
-
-
-## 5. 📋 MANUAL - Install Go (node0)
-
-
-
-
-
-OVN-Kubernetes requires Go to build binaries.
-
-```
-GO_VERSION=1.21.7
-curl -LO https://go.dev/dl/go${GO_VERSION}.linux-amd64.tar.gz
-sudo tar -C /usr/local -xzf go${GO_VERSION}.linux-amd64.tar.gz
-echo 'export PATH=$PATH:/usr/local/go/bin' >> ~/.profile
-source ~/.profile
-```
-
-Verify:
-
-```
-go version
-```
-
-
-
----
-
-
-
-
-
-## 6. 📋 MANUAL - Build OVN-Kubernetes Images (node0)
-
-
-
-```
-git clone git@github.com:Anirudh-R-1201/ovn-kubernetes.git
-cd ovn-kubernetes/dist/images
-make ubuntu-image
-```
-
-
-
-Retag the image:
-
-```
-docker tag ovn-kube-ubuntu:latest ovn-kube:latest
-```
-
-
-
----
-
-
-
-
-
-## 7. 📋 MANUAL - Distribute Images to Workers
-
-
-
-
+This single script automates all the following steps:
+- Cloning the custom OVN-Kubernetes repository from git@github.com:Anirudh-R-1201/ovn-kubernetes.git
+- Installing Go (if not present)
+- Building the OVN-Kubernetes Ubuntu image
+- Distributing the image to all worker nodes
+- Generating the CNI manifest with correct CIDRs
+- Deploying OVN-Kubernetes to the cluster
 
 On **node0**:
 
-```
-docker save ovn-kube:latest | gzip > ovn-kube.tar.gz
-scp ovn-kube.tar.gz node1:
-scp ovn-kube.tar.gz node2:
-```
-
-On **node1** and **node2**:
-
-```
-gunzip -c ovn-kube.tar.gz | docker load
+```bash
+chmod +x install-ovn-cni.sh
+./install-ovn-cni.sh
 ```
 
+**What this script does:**
 
+1. Clones/updates the OVN-Kubernetes repository (nw-affinity branch)
+2. Installs Go 1.21.7 if not already present
+3. Builds the ovn-kube-ubuntu image (~10-15 minutes)
+4. Tags the image as ovn-kube:latest
+5. Distributes the image to all worker nodes via scp
+6. Generates the CNI manifest with pod CIDR (10.128.0.0/14) and service CIDR (172.30.0.0/16)
+7. Deploys OVN-Kubernetes to the cluster
+8. Waits for pods to be ready and verifies node status
 
----
+**Expected output:**
 
-
-
-
-
-## 8. 📋 MANUAL - Deploy OVN-Kubernetes CNI (node0)
-
-
-
-
-
-Generate the CNI manifest:
-
-```
-cd ~/ovn-kubernetes
-./dist/images/daemonset.sh \
-  --image=ovn-kube:latest \
-  --net-cidr=10.128.0.0/14 \
-  --svc-cidr=172.30.0.0/16 \
-  > ovn-kubernetes.yaml
-```
-
-Apply it:
+After completion, all nodes should show `Ready` status:
 
 ```
-kubectl apply -f ovn-kubernetes.yaml
+NAME     STATUS   ROLES           AGE   VERSION
+node0    Ready    control-plane   ...   v1.29.15
+node1    Ready    <none>          ...   v1.29.15
+node2    Ready    <none>          ...   v1.29.15
 ```
 
-Verify:
+And OVN-Kubernetes pods should be running:
 
 ```
 kubectl get pods -n ovn-kubernetes
-kubectl get nodes
 ```
 
-All nodes should transition to Ready.
+**Troubleshooting:**
+
+If image distribution fails, you can manually copy the image to workers:
+
+```bash
+# On node0
+docker save ovn-kube:latest | gzip > ovn-kube.tar.gz
+scp ovn-kube.tar.gz node1:~/
+scp ovn-kube.tar.gz node2:~/
+
+# On each worker
+gunzip -c ~/ovn-kube.tar.gz | docker load
+```
+
+**Customization:**
+
+You can customize the installation by setting environment variables:
+
+```bash
+# Use a different branch
+OVN_BRANCH=main ./install-ovn-cni.sh
+
+# Or edit the script to change Pod/Service CIDRs
+```
 
 
 
