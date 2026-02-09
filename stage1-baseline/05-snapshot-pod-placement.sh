@@ -8,8 +8,9 @@ KUBECONFIG_PATH="${KUBECONFIG_PATH:-${ROOT_DIR}/kubeconfig-${CLUSTER_NAME}}"
 INTERVAL_SEC="${INTERVAL_SEC:-30}"
 COUNT="${COUNT:-20}"
 
-TS="$(date +"%Y%m%d-%H%M%S")"
-OUT_DIR="${ROOT_DIR}/data/stage1-baseline-${TS}/pod-placement"
+RUN_ID="${RUN_ID:-$(date +"%Y%m%d-%H%M%S")}"
+DATA_DIR_BASE="${ROOT_DIR}/data/${RUN_ID}"
+OUT_DIR="${DATA_DIR_BASE}/pod-placement"
 INDEX_FILE="${OUT_DIR}/index.jsonl"
 
 mkdir -p "${OUT_DIR}"

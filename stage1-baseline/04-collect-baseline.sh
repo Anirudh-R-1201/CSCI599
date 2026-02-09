@@ -4,8 +4,10 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CLUSTER_NAME="${CLUSTER_NAME:-ovn-baseline}"
 KUBECONFIG_PATH="${KUBECONFIG_PATH:-${ROOT_DIR}/kubeconfig-${CLUSTER_NAME}}"
-TS="$(date +"%Y%m%d-%H%M%S")"
-OUT_DIR="${ROOT_DIR}/data/stage1-baseline-${TS}"
+RUN_ID="${RUN_ID:-$(date +"%Y%m%d-%H%M%S")}"
+DATA_DIR_BASE="${ROOT_DIR}/data/${RUN_ID}"
+OUT_DIR="${DATA_DIR_BASE}/baseline"
+LOADGEN_DIR="${LOADGEN_DIR:-${DATA_DIR_BASE}/loadgen}"
 
 mkdir -p "${OUT_DIR}"
 export OUT_DIR

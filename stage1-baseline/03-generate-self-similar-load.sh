@@ -14,11 +14,13 @@ ALPHA_QPS="${ALPHA_QPS:-1.5}"
 ALPHA_DURATION="${ALPHA_DURATION:-1.4}"
 MAX_SLEEP="${MAX_SLEEP:-20}"
 
-TS="$(date +"%Y%m%d-%H%M%S")"
-DATA_DIR="${ROOT_DIR}/data/stage1-baseline-${TS}/loadgen"
+RUN_ID="${RUN_ID:-$(date +"%Y%m%d-%H%M%S")}"
+DATA_DIR_BASE="${ROOT_DIR}/data/${RUN_ID}"
+DATA_DIR="${DATA_DIR_BASE}/loadgen"
 META_FILE="${DATA_DIR}/bursts.jsonl"
 
 mkdir -p "${DATA_DIR}"
+export LOADGEN_DIR="${DATA_DIR}"
 
 echo "Deploying Fortio load generator pod..."
 kubectl --kubeconfig "${KUBECONFIG_PATH}" apply -f "${ROOT_DIR}/fortio-loadgen.yaml"
