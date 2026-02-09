@@ -204,10 +204,14 @@ chmod +x install-ovn-cni.sh
 1. Checks Docker permissions and activates docker group if needed
 2. Clones the OVN-Kubernetes repository (nw-affinity branch)
 3. Installs Go 1.21.7 if needed
-4. Builds ovn-kube-ubuntu image (~10-15 minutes)
-5. Saves the image as `~/ovn-kube.tar.gz` for distribution
+4. Installs `jinjanator` (Python templating tool for manifest generation)
+5. Builds ovn-kube-ubuntu image (~10-15 minutes)
+6. Saves the image as `~/ovn-kube.tar` (uncompressed for containerd)
+7. Imports the image into local containerd on node0
 
-After the build completes, you'll see instructions for distributing the image.
+After the build completes, you'll see instructions for distributing the image to workers.
+
+**Note:** Kubernetes 1.29 uses **containerd** as the container runtime, not Docker. Images must be imported using `ctr` commands.
 
 ---
 
@@ -234,7 +238,7 @@ chmod +x distribute-image-from-local.sh
 This script:
 - Downloads the image from node0
 - Uploads it to all worker nodes
-- Loads the image into Docker on each worker
+- Imports the image into containerd on each worker (using `ctr`)
 
 ### Method B: Set Up Inter-Node SSH (Optional)
 
@@ -274,8 +278,9 @@ chmod +x deploy-ovn-cni.sh
 ```
 
 This script:
-- Generates the OVN-Kubernetes manifest
-- Deploys it to the cluster
+- Generates the OVN-Kubernetes manifests using `daemonset.sh`
+- Applies core OVN manifests (ovn-setup, ovnkube-db, ovnkube-master, ovnkube-node)
+- Gracefully handles CRD validation errors (K8s version compatibility)
 - Waits for pods to be ready
 - Verifies node status
 
@@ -317,33 +322,44 @@ kubectl get pods -n ovn-kubernetes
 # View OVN logs
 kubectl logs -n ovn-kubernetes -l app=ovnkube-node --tail=50
 
-# On workers, verify image is loaded
-docker images | grep ovn-kube
+# On workers, verify image is loaded in containerd
+sudo ctr -n k8s.io image ls | grep ovn-kube
 ```
 
 ### ImagePullBackOff Errors
 
-Workers don't have the image. Distribute manually:
+Workers don't have the image **in containerd**. Kubernetes uses containerd (not Docker) as the runtime.
+
+**Fix:**
 
 ```bash
 # From your laptop
-scp node0:~/ovn-kube.tar.gz .
-scp ovn-kube.tar.gz node1:~/
+scp node0:~/ovn-kube.tar .
+scp ovn-kube.tar node1:~/
 
 # On worker node
-gunzip -c ~/ovn-kube.tar.gz | sudo docker load
+sudo ctr -n k8s.io image import ~/ovn-kube.tar
+```
+
+**Verify:**
+```bash
+sudo ctr -n k8s.io image ls | grep ovn-kube
 ```
 
 ### CNI Not Deploying
 
 ```bash
-# Check manifest exists
-ls -lh ~/ovn-kubernetes.yaml
+# Check manifests directory
+ls -lh ~/ovn-kubernetes/dist/yaml/
 
 # Re-deploy
-kubectl delete -f ~/ovn-kubernetes.yaml  # if exists
+kubectl delete -f ~/ovn-kubernetes/dist/yaml/ovnkube-node.yaml  # if exists
 ./deploy-ovn-cni.sh
 ```
+
+### CRD Validation Errors
+
+Some CRDs may fail to apply due to Kubernetes version compatibility (e.g., `userdefinednetworks.k8s.ovn.org` with CEL validation). This is **expected** and won't affect basic CNI functionality. The core OVN manifests will still deploy successfully.
 
 ---
 

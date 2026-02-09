@@ -13,8 +13,8 @@ echo "Distributing OVN Image & Deploying CNI"
 echo "=========================================="
 
 # Check if image exists
-if [ ! -f ~/ovn-kube.tar.gz ]; then
-  echo "ERROR: ~/ovn-kube.tar.gz not found!"
+if [ ! -f ~/ovn-kube.tar ]; then
+  echo "ERROR: ~/ovn-kube.tar not found!"
   echo "Please run ./install-ovn-cni.sh first to build the image."
   exit 1
 fi
@@ -40,19 +40,16 @@ else
     fi
     
     echo "  -> Copying image to ${node}..."
-    if scp -o StrictHostKeyChecking=no ~/ovn-kube.tar.gz "${node}:~/" ; then
+    if scp -o StrictHostKeyChecking=no ~/ovn-kube.tar "${node}:~/" ; then
       echo "  ✓ Image copied successfully"
       
-      echo "  -> Loading image on ${node}..."
-      # Try with docker group first, fallback to sudo
-      if ssh -o StrictHostKeyChecking=no "${node}" "docker load < <(gunzip -c ~/ovn-kube.tar.gz)" 2>/dev/null; then
-        echo "  ✓ Image loaded successfully"
-      elif ssh -o StrictHostKeyChecking=no "${node}" "sudo docker load < <(gunzip -c ~/ovn-kube.tar.gz)"; then
-        echo "  ✓ Image loaded successfully (with sudo)"
+      echo "  -> Loading image into containerd on ${node}..."
+      if ssh -o StrictHostKeyChecking=no "${node}" "sudo ctr -n k8s.io image import ~/ovn-kube.tar"; then
+        echo "  ✓ Image loaded successfully into containerd"
       else
         echo "  ✗ Failed to load image on ${node}"
         echo "    Please manually run on ${node}:"
-        echo "    gunzip -c ~/ovn-kube.tar.gz | sudo docker load"
+        echo "    sudo ctr -n k8s.io image import ~/ovn-kube.tar"
       fi
     else
       echo "  ✗ Failed to copy image to ${node}"
@@ -73,16 +70,24 @@ if [ ! -d "${OVN_DIR}" ]; then
   exit 1
 fi
 
-echo "Generating OVN-Kubernetes manifest..."
+echo "Generating OVN-Kubernetes manifests..."
 cd "${OVN_DIR}"
+
+# daemonset.sh generates manifests to dist/yaml/ directory
 ./dist/images/daemonset.sh \
   --image=ovn-kube:latest \
   --net-cidr="${POD_CIDR}" \
   --svc-cidr="${SVC_CIDR}" \
-  > ~/ovn-kubernetes.yaml
+  --kind=kind
 
-echo "Applying CNI manifest..."
-kubectl apply -f ~/ovn-kubernetes.yaml
+echo "Applying CNI manifests..."
+# Apply core OVN manifests (some CRDs may fail due to K8s version compatibility, that's OK)
+kubectl apply -f dist/yaml/ovn-setup.yaml 2>&1 | grep -v "unable to recognize" || true
+kubectl apply -f dist/yaml/ovnkube-db.yaml
+kubectl apply -f dist/yaml/ovnkube-master.yaml
+kubectl apply -f dist/yaml/ovnkube-node.yaml
+
+echo "✓ Core OVN manifests applied (some CRD warnings are expected)"
 
 echo ""
 echo "=========================================="

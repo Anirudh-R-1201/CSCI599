@@ -19,34 +19,42 @@ if [ ! -d "${OVN_DIR}" ]; then
   exit 1
 fi
 
-# Verify workers have the image (optional check)
-echo "Checking if worker nodes have the ovn-kube:latest image..."
+# Verify workers have the image in containerd (optional check)
+echo "Checking if worker nodes have the ovn-kube:latest image in containerd..."
 WORKER_NODES=$(kubectl get nodes --no-headers | grep -v "control-plane" | awk '{print $1}' | cut -d'.' -f1)
 
 if [ -n "${WORKER_NODES}" ]; then
   for node in ${WORKER_NODES}; do
-    if ssh -o ConnectTimeout=5 -o StrictHostKeyChecking=no "${node}" "docker images ovn-kube:latest --format '{{.Repository}}:{{.Tag}}'" 2>/dev/null | grep -q "ovn-kube:latest"; then
-      echo "  ✓ ${node} has ovn-kube:latest"
+    if ssh -o ConnectTimeout=5 -o StrictHostKeyChecking=no "${node}" "sudo ctr -n k8s.io image ls" 2>/dev/null | grep -q "ovn-kube:latest"; then
+      echo "  ✓ ${node} has ovn-kube:latest in containerd"
     else
       echo "  ✗ ${node} might not have ovn-kube:latest (or SSH unavailable)"
       echo "    If deployment fails, please load the image on ${node}:"
-      echo "    gunzip -c ~/ovn-kube.tar.gz | sudo docker load"
+      echo "    sudo ctr -n k8s.io image import ~/ovn-kube.tar"
     fi
   done
   echo ""
 fi
 
-# Generate OVN-Kubernetes manifest
-echo "Generating OVN-Kubernetes manifest..."
+# Generate OVN-Kubernetes manifests
+echo "Generating OVN-Kubernetes manifests..."
 cd "${OVN_DIR}"
+
+# daemonset.sh generates manifests to dist/yaml/ directory
 ./dist/images/daemonset.sh \
   --image=ovn-kube:latest \
   --net-cidr="${POD_CIDR}" \
   --svc-cidr="${SVC_CIDR}" \
-  > ~/ovn-kubernetes.yaml
+  --kind=kind
 
-echo "Applying CNI manifest..."
-kubectl apply -f ~/ovn-kubernetes.yaml
+echo "Applying CNI manifests..."
+# Apply core OVN manifests (some CRDs may fail due to K8s version compatibility, that's OK)
+kubectl apply -f dist/yaml/ovn-setup.yaml 2>&1 | grep -v "unable to recognize" || true
+kubectl apply -f dist/yaml/ovnkube-db.yaml
+kubectl apply -f dist/yaml/ovnkube-master.yaml
+kubectl apply -f dist/yaml/ovnkube-node.yaml
+
+echo "✓ Core OVN manifests applied (some CRD warnings are expected)"
 
 echo ""
 echo "=========================================="

@@ -56,7 +56,7 @@ fi
 
 # Step 2: Install Go if not present
 if ! command -v go >/dev/null 2>&1; then
-  echo "[2/6] Installing Go ${GO_VERSION}..."
+  echo "[2/7] Installing Go ${GO_VERSION}..."
   cd ~
   curl -LO "https://go.dev/dl/go${GO_VERSION}.linux-amd64.tar.gz"
   sudo tar -C /usr/local -xzf "go${GO_VERSION}.linux-amd64.tar.gz"
@@ -65,42 +65,62 @@ if ! command -v go >/dev/null 2>&1; then
   rm "go${GO_VERSION}.linux-amd64.tar.gz"
   go version
 else
-  echo "[2/6] Go already installed: $(go version)"
+  echo "[2/7] Go already installed: $(go version)"
 fi
 
-# Step 3: Build OVN-Kubernetes image
-echo "[3/6] Building OVN-Kubernetes Ubuntu image (this may take 10-15 minutes)..."
+# Step 2.5: Install jinjanator (required for manifest generation)
+if ! command -v jinjanate >/dev/null 2>&1; then
+  echo "[3/7] Installing jinjanator..."
+  if ! command -v pip3 >/dev/null 2>&1; then
+    sudo apt update
+    sudo apt install -y python3-pip
+  fi
+  pip3 install jinjanator
+else
+  echo "[3/7] jinjanator already installed"
+fi
+
+# Step 4: Build OVN-Kubernetes image
+echo "[4/7] Building OVN-Kubernetes Ubuntu image (this may take 10-15 minutes)..."
 cd "${OVN_DIR}/dist/images"
 make ubuntu-image
 
-# Step 4: Tag the image
-echo "[4/6] Tagging image as ovn-kube:latest..."
+# Step 5: Tag and save image
+echo "[5/7] Tagging image as ovn-kube:latest..."
 docker tag ovn-kube-ubuntu:latest ovn-kube:latest
 
-# Step 5: Save image for distribution
-echo "[5/6] Saving image for distribution to worker nodes..."
+# Step 6: Save image for containerd (uncompressed tar)
+echo "[6/7] Saving image for distribution to worker nodes..."
 cd ~
-docker save ovn-kube:latest | gzip > ovn-kube.tar.gz
+docker save ovn-kube:latest -o ovn-kube.tar
+
+# Step 7: Import into local containerd
+echo "[7/7] Importing image into local containerd..."
+sudo ctr -n k8s.io image import ovn-kube.tar
+echo "✓ Image imported into containerd on node0"
 
 echo ""
 echo "=========================================="
-echo "Image built and saved successfully!"
+echo "Image built and imported successfully!"
 echo "=========================================="
+echo ""
+echo "Image saved at: ~/ovn-kube.tar (uncompressed for containerd)"
 echo ""
 echo "Next steps for CloudLab clusters:"
 echo ""
 echo "Option A - Distribute via your local machine (RECOMMENDED for CloudLab):"
-echo "  1. From your laptop: scp node0:~/ovn-kube.tar.gz ."
-echo "  2. From your laptop: scp ovn-kube.tar.gz node1:~/"
-echo "  3. On node1: gunzip -c ~/ovn-kube.tar.gz | sudo docker load"
+echo "  1. From your laptop: scp node0:~/ovn-kube.tar ."
+echo "  2. From your laptop: scp ovn-kube.tar node1:~/"
+echo "  3. On node1: sudo ctr -n k8s.io image import ~/ovn-kube.tar"
 echo "  4. Repeat for any additional worker nodes"
 echo "  5. Come back to node0 and run: ./deploy-ovn-cni.sh"
 echo ""
 echo "Option B - Set up SSH keys between nodes:"
 echo "  1. On each worker from your laptop:"
-echo "     ssh worker 'echo \"$(cat ~/.ssh/id_ed25519.pub)\" >> ~/.ssh/authorized_keys'"
+echo "     ssh worker 'echo \"\$(cat ~/.ssh/id_ed25519.pub)\" >> ~/.ssh/authorized_keys'"
 echo "  2. Test with: ssh node1 hostname"
 echo "  3. Then run: ./distribute-and-deploy-cni.sh"
 echo ""
-echo "Image file location: ~/ovn-kube.tar.gz"
+echo "IMPORTANT: Images must be imported into CONTAINERD (not Docker)"
+echo "  Kubernetes uses containerd as the container runtime"
 echo "=========================================="

@@ -10,7 +10,7 @@ NODE1_HOST="${NODE1_HOST:-anirudh1@ms0844.utah.cloudlab.us}"
 # Add more workers as needed:
 # NODE2_HOST="${NODE2_HOST:-anirudh1@msXXXX.utah.cloudlab.us}"
 
-IMAGE_FILE="ovn-kube.tar.gz"
+IMAGE_FILE="ovn-kube.tar"
 
 echo "=========================================="
 echo "OVN Image Distribution Helper"
@@ -61,13 +61,13 @@ fi
 
 echo ""
 
-# Step 3: Load images on worker nodes
-echo "[3/3] Loading images on worker nodes..."
+# Step 3: Load images into containerd on worker nodes
+echo "[3/3] Loading images into containerd on worker nodes..."
 
 # Worker 1
 echo "  -> Loading on node1..."
-if ssh "${NODE1_HOST}" "gunzip -c ~/${IMAGE_FILE} | sudo docker load" ; then
-  echo "  ✓ Image loaded on node1"
+if ssh "${NODE1_HOST}" "sudo ctr -n k8s.io image import ~/${IMAGE_FILE}" ; then
+  echo "  ✓ Image loaded into containerd on node1"
 else
   echo "  ✗ Failed to load image on node1"
   exit 1
@@ -75,8 +75,8 @@ fi
 
 # Worker 2 (uncomment if you have a second worker)
 # echo "  -> Loading on node2..."
-# if ssh "${NODE2_HOST}" "gunzip -c ~/${IMAGE_FILE} | sudo docker load" ; then
-#   echo "  ✓ Image loaded on node2"
+# if ssh "${NODE2_HOST}" "sudo ctr -n k8s.io image import ~/${IMAGE_FILE}" ; then
+#   echo "  ✓ Image loaded into containerd on node2"
 # else
 #   echo "  ✗ Failed to load image on node2"
 #   exit 1

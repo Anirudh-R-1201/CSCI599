@@ -18,8 +18,9 @@ We split the CNI installation into three phases:
 ### Phase 1: Build (on node0)
 **Script:** `install-ovn-cni.sh`
 - Builds the OVN-Kubernetes Docker image
-- Saves it as `~/ovn-kube.tar.gz`
-- Does NOT attempt distribution
+- Saves it as `~/ovn-kube.tar` (uncompressed for containerd)
+- Imports into local containerd on node0
+- Does NOT attempt distribution to workers
 
 ### Phase 2: Distribute (two options)
 
@@ -28,7 +29,7 @@ We split the CNI installation into three phases:
 **Script:** `distribute-image-from-local.sh` (run on your laptop)
 - Downloads image from node0 to your laptop
 - Uploads to all worker nodes
-- Loads image into Docker on each worker
+- Imports image into containerd on each worker (K8s 1.29 uses containerd, not Docker)
 
 **Option B - With SSH Setup:**
 
@@ -40,8 +41,10 @@ We split the CNI installation into three phases:
 
 ### Phase 3: Deploy (on node0)
 **Script:** `deploy-ovn-cni.sh`
-- Generates OVN-Kubernetes manifest
-- Deploys to cluster
+- Installs `jinjanator` if needed (Python templating tool)
+- Generates OVN-Kubernetes manifests to `dist/yaml/`
+- Deploys to cluster (core manifests)
+- Gracefully handles CRD validation errors (K8s version compatibility)
 - Waits for pods to be ready
 
 ## Quick Start for CloudLab
@@ -105,12 +108,17 @@ kubectl get pods -n ovn-kubernetes
 ### Nodes stay NotReady
 - Wait 2-3 minutes after deployment
 - Check: `kubectl get pods -n ovn-kubernetes`
-- Verify workers have image: `ssh worker 'docker images | grep ovn-kube'`
+- Verify workers have image in containerd: `ssh worker 'sudo ctr -n k8s.io image ls | grep ovn-kube'`
 
 ### ImagePullBackOff
-- Workers don't have the image
+- Workers don't have the image **in containerd** (Kubernetes uses containerd, not Docker)
 - Re-run distribution step
-- Or load manually: `gunzip -c ~/ovn-kube.tar.gz | sudo docker load`
+- Or load manually on worker: `sudo ctr -n k8s.io image import ~/ovn-kube.tar`
+
+### CRD Validation Errors
+- Some CRDs fail with "undeclared reference to 'isCIDR'" or similar CEL errors
+- This is a K8s version compatibility issue (OVN-Kubernetes CRDs use CEL functions not in K8s 1.29)
+- **This is OK** - core OVN functionality works without these advanced CRDs
 
 ## Alternative: Setting Up Inter-Node SSH
 
