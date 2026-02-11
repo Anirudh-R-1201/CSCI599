@@ -1,317 +1,312 @@
-
-
-```
 # Kubernetes + OVN-Kubernetes Setup on CloudLab
 
-This document describes how to provision a multi-node Kubernetes cluster
-on CloudLab and deploy a custom OVN-Kubernetes CNI (from the `nw-affinity`
-branch). 
-
-**Automated Steps:** Kubernetes cluster setup and OVN-Kubernetes CNI deployment (scripts provided)
-**Manual Steps:** None - all steps are automated
+This guide describes how to provision a multi-node Kubernetes cluster on CloudLab and manually build/deploy OVN-Kubernetes CNI.
 
 ---
 
 ## Repository Contents
-```
 
+```
 CSCI599/
-
-├── all.sh              # AUTOMATED: Common setup (containerd, Docker, Kubernetes v1.29, networking)
-
-├── node0.sh            # AUTOMATED: Control-plane initialization with kubeadm
-
-├── worker.sh                     # AUTOMATED: Worker node join script
-
-├── install-ovn-cni.sh            # Build OVN-Kubernetes image (run on node0)
-
-├── distribute-and-deploy-cni.sh  # Distribute image & deploy CNI (if SSH configured)
-
-├── deploy-ovn-cni.sh             # Deploy CNI only (after manual image distribution)
-
-├── distribute-image-from-local.sh # Helper script for image distribution (run on laptop)
-
-├── README.md                     # This document
-
+├── all.sh              # Common setup (containerd, Docker, Kubernetes v1.29, networking)
+├── node0.sh            # Control-plane initialization with kubeadm
+├── worker.sh           # Worker node join script
+├── stage1-baseline/    # Kind-based baseline testing scripts
+└── README.md           # This document
 ```
-
-## What's Automated vs Manual
-
-**✅ AUTOMATED (Use provided scripts):**
-- Base system setup and dependencies (containerd, Docker, Kubernetes)
-- Kernel and network configuration
-- Kubernetes v1.29 cluster initialization  
-- Worker node joining
-- Custom OVN-Kubernetes CNI build and deployment (from git@github.com:Anirudh-R-1201/ovn-kubernetes.git)
-- Go installation
-- Image building and distribution to all nodes
-- CNI manifest generation and deployment
 
 ---
 
 ## Prerequisites
 
-- A CloudLab experiment with **3 Ubuntu 22.04 nodes**
+- CloudLab experiment with **2+ Ubuntu 22.04 nodes**
   - `node0`: control plane
-  - `node1`, `node2`: worker nodes
+  - `node1`, `node2`, ...: worker nodes
 - SSH access to all nodes
 - Internet connectivity on all nodes
-- Git access to:
-  - `Anirudh-R-1201/ovn-kubernetes`
+- Git access to `Anirudh-R-1201/ovn-kubernetes` (nw-affinity branch)
 
 ---
 
-## 1. ✅ AUTOMATED - Common Setup (ALL Nodes)
+## Part 1: Kubernetes Cluster Setup
 
-On **node0, node1, and node2**, run:
+### Step 1: Common Setup (ALL Nodes)
+
+On **all nodes** (node0, node1, node2, ...):
 
 ```bash
+cd ~/CSCI599
 chmod +x all.sh
 ./all.sh
 ```
 
-This script:
-- Installs and configures **containerd** (CRI for Kubernetes ≥1.24)  
-- Installs Docker (used for building OVN images)
-- Adds current user to docker group (for permission-less Docker access)
+**What this does:**
+- Installs containerd (Kubernetes ≥1.24 CRI)
+- Installs Docker (for building images)
+- Adds user to docker group
 - Installs Kubernetes v1.29 (kubelet, kubeadm, kubectl)
-- Configures kubelet to use containerd runtime
-- Applies required kernel and sysctl settings (persistent across reboots)
-- Disables swap (persistent across reboots)
-- Enables and starts kubelet service
+- Configures kubelet for containerd
+- Sets up networking (bridge-netfilter, ip_forward)
+- Disables swap
+- Enables kubelet service
 
-**⚠️ IMPORTANT:** After running this script, you need to activate Docker group membership:
-
+**After running, activate Docker permissions:**
 ```bash
-# Option 1: Activate docker group in current session
 newgrp docker
-
-# Option 2: Log out and log back in (more reliable)
+# OR log out and log back in
 ```
-
-If you skip this step, the CNI installation script will handle it automatically.
-
-
-
-
 
 ---
 
-
-
-
-
-## 2. ✅ AUTOMATED - Initialize Control Plane (node0)
-
-
-
-
+### Step 2: Initialize Control Plane (node0 only)
 
 On **node0**:
 
-```
+```bash
 chmod +x node0.sh
 ./node0.sh
 ```
 
-This script:
+**What this does:**
+- Runs `kubeadm init` with Pod CIDR `10.128.0.0/14` and Service CIDR `172.30.0.0/16`
+- Copies kubeconfig to `~/.kube/config`
+- Generates `join.sh` with the worker join command
 
-
-
-- Runs kubeadm init
-- Configures kubectl using admin.conf
-- Generates a worker join command in join.sh
-
-
-
-
-
-> **Important:**
-
-> Always use the exact IP shown in join.sh when joining workers.
-
-> This IP is embedded in the API server certificate.
-
-
+**Save the join command:**
+```bash
+cat join.sh
+```
 
 ---
 
+### Step 3: Join Worker Nodes
 
+On **each worker node** (node1, node2, ...):
 
-
-
-## 3. ✅ AUTOMATED - Join Worker Nodes (node1 & node2)
-
-
-
-
-
-Copy the join command from node0/join.sh.
-
-
-
-On **each worker node**:
-
-```
+```bash
 chmod +x worker.sh
-./worker.sh "<kubeadm join ...>"
+./worker.sh "<kubeadm join command from node0>"
 ```
 
-Example:
-
+**Example:**
+```bash
+./worker.sh "kubeadm join 128.110.217.119:6443 --token abc123... --discovery-token-ca-cert-hash sha256:xyz..."
 ```
-./worker.sh "kubeadm join 128.110.x.x:6443 --token <TOKEN> --discovery-token-ca-cert-hash sha256:<HASH>"
-```
-
-Verify **from node0 only**:
-
-```
-kubectl get nodes
-```
-
-Expected output (before CNI installation):
-
-```
-node0   NotReady   control-plane
-node1   NotReady
-node2   NotReady
-```
-
-This is expected until a CNI is installed.
-
-
 
 ---
 
-
-
-
-
-## 4. Build OVN-Kubernetes CNI (node0)
-
-The CNI installation is split into build and deployment phases to handle CloudLab's SSH restrictions.
-
-### Step 4a: Build the OVN Image
+### Step 4: Verify Cluster
 
 On **node0**:
 
 ```bash
-chmod +x install-ovn-cni.sh
-./install-ovn-cni.sh
+kubectl get nodes
+# All nodes should show, but will be NotReady (no CNI yet)
+
+kubectl get pods -A
+# Only kube-system pods will be running
 ```
-
-**What this does:**
-1. Checks Docker permissions and activates docker group if needed
-2. Clones the OVN-Kubernetes repository (nw-affinity branch)
-3. Installs Go 1.21.7 if needed
-4. Installs `jinjanator` (Python templating tool for manifest generation)
-5. Builds ovn-kube-ubuntu image (~10-15 minutes)
-6. Saves the image as `~/ovn-kube.tar` (uncompressed for containerd)
-7. Imports the image into local containerd on node0
-
-After the build completes, you'll see instructions for distributing the image to workers.
-
-**Note:** Kubernetes 1.29 uses **containerd** as the container runtime, not Docker. Images must be imported using `ctr` commands.
 
 ---
 
-## 5. Distribute OVN Image to Workers
+## Part 2: OVN-Kubernetes CNI Deployment (Manual)
 
-CloudLab nodes cannot SSH to each other by default. Choose one of these methods:
-
-### Method A: Via Your Local Machine (RECOMMENDED)
-
-This is the easiest method for CloudLab.
-
-**On your laptop:**
+### Step 1: Install Dependencies (node0)
 
 ```bash
-chmod +x distribute-image-from-local.sh
+# Install Go 1.21.7
+cd ~
+curl -LO https://go.dev/dl/go1.21.7.linux-amd64.tar.gz
+sudo tar -C /usr/local -xzf go1.21.7.linux-amd64.tar.gz
+echo 'export PATH=$PATH:/usr/local/go/bin' >> ~/.profile
+export PATH=$PATH:/usr/local/go/bin
+go version
 
-# Edit the script to set your CloudLab hostnames
-# NODE0_HOST=anirudh1@ms0835.utah.cloudlab.us
-# NODE1_HOST=anirudh1@ms0844.utah.cloudlab.us
-
-./distribute-image-from-local.sh
+# Install jinjanator (for manifest generation)
+pip3 install --user jinjanator
+export PATH="$HOME/.local/bin:$PATH"
+echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.profile
 ```
-
-This script:
-- Downloads the image from node0
-- Uploads it to all worker nodes
-- Imports the image into containerd on each worker (using `ctr`)
-
-### Method B: Set Up Inter-Node SSH (Optional)
-
-If you want nodes to communicate directly:
-
-**From your laptop, for each worker:**
-
-```bash
-# Get node0's public key
-ssh node0 cat ~/.ssh/id_ed25519.pub
-
-# Add it to each worker's authorized_keys
-ssh node1 "echo 'ssh-ed25519 AAAA...' >> ~/.ssh/authorized_keys"
-ssh node2 "echo 'ssh-ed25519 AAAA...' >> ~/.ssh/authorized_keys"
-```
-
-**Then on node0:**
-
-```bash
-chmod +x distribute-and-deploy-cni.sh
-./distribute-and-deploy-cni.sh
-```
-
-This script distributes the image AND deploys the CNI automatically.
 
 ---
 
-## 6. Deploy the CNI (node0)
+### Step 2: Clone and Patch OVN-Kubernetes (node0)
 
-After distributing the image using Method A above:
+```bash
+# Clone your custom OVN-Kubernetes fork
+cd ~
+git clone git@github.com:Anirudh-R-1201/ovn-kubernetes.git
+cd ovn-kubernetes
+git checkout nw-affinity
+
+# CRITICAL: Patch kubectl commands to fix API server discovery issues
+# This adds --validate=false to all kubectl commands in the startup scripts
+sed -i.bak 's/kubectl apply -f/kubectl apply --validate=false -f/g' dist/images/ovnkube.sh
+sed -i.bak 's/kubectl create -f/kubectl create --validate=false -f/g' dist/images/ovnkube.sh
+sed -i.bak 's/kubectl patch \([^-]\)/kubectl patch --validate=false \1/g' dist/images/ovnkube.sh
+
+# Verify patch was applied
+grep "kubectl apply --validate=false" dist/images/ovnkube.sh
+```
+
+**Why this patch is needed:**
+- CloudLab kubeadm clusters sometimes have API server discovery issues
+- The error: "server rejected our request for an unknown reason"
+- Without this patch, `ovnkube-db` pods will crash in CrashLoopBackOff
+- The `--validate=false` flag bypasses the broken OpenAPI validation
+
+---
+
+### Step 3: Build OVN-Kubernetes Image (node0)
+
+```bash
+cd ~/ovn-kubernetes/dist/images
+
+# Build Ubuntu-based image (10-15 minutes)
+make ubuntu-image
+
+# Tag for deployment
+docker tag ovn-kube-ubuntu:latest ovn-kube:latest
+
+# Save for distribution to workers
+cd ~
+docker save ovn-kube:latest -o ovn-kube.tar
+
+# Import into local containerd
+sudo ctr -n k8s.io image import ovn-kube.tar
+```
+
+---
+
+### Step 4: Distribute Image to Workers
+
+**From your laptop:**
+
+```bash
+# Download from node0
+scp node0:~/ovn-kube.tar .
+
+# Upload to each worker
+scp ovn-kube.tar node1:~/
+scp ovn-kube.tar node2:~/
+```
+
+**On each worker node:**
+
+```bash
+sudo ctr -n k8s.io image import ~/ovn-kube.tar
+
+# Verify
+sudo ctr -n k8s.io image ls | grep ovn-kube
+```
+
+---
+
+### Step 5: Generate OVN Manifests (node0)
+
+```bash
+cd ~/ovn-kubernetes/dist/images
+
+# Ensure jinjanate is in PATH
+export PATH="$HOME/.local/bin:$PATH"
+
+# Generate manifests
+./daemonset.sh \
+  --image=ovn-kube:latest \
+  --net-cidr=10.128.0.0/14 \
+  --svc-cidr=172.30.0.0/16
+
+# Verify manifests were created
+ls -lh ../yaml/
+```
+
+---
+
+### Step 6: Prepare OVN Directories (All Nodes)
 
 **On node0:**
-
 ```bash
-chmod +x deploy-ovn-cni.sh
-./deploy-ovn-cni.sh
+sudo mkdir -p /var/lib/ovn/etc /var/lib/ovn/data
+sudo chmod 755 /var/lib/ovn /var/lib/ovn/etc /var/lib/ovn/data
 ```
 
-This script:
-- Automatically installs `jinjanator` if not present (required for manifest generation)
-- Ensures the PATH includes `~/.local/bin` for jinjanate command
-- Verifies that workers have the image in containerd
-- Generates the OVN-Kubernetes manifests using `daemonset.sh` with proper working directory
-- Applies core OVN manifests (ovn-setup, ovnkube-db, ovnkube-master, ovnkube-node)
-- Gracefully handles CRD validation errors (K8s version compatibility)
-- Waits for pods to be ready
-- Verifies node status
+**On each worker (node1, node2, ...):**
+```bash
+ssh node1 "sudo mkdir -p /var/lib/ovn/etc /var/lib/ovn/data && sudo chmod 755 /var/lib/ovn /var/lib/ovn/etc /var/lib/ovn/data"
+ssh node2 "sudo mkdir -p /var/lib/ovn/etc /var/lib/ovn/data && sudo chmod 755 /var/lib/ovn /var/lib/ovn/etc /var/lib/ovn/data"
+```
 
-**What happens:**
-The script will generate YAML manifests from Jinja2 templates and apply them to your cluster. If manifest generation fails, it will try an alternative approach using correct directory context.
+---
 
-**Verification:**
-
-Check OVN-Kubernetes pods (should all be Running):
+### Step 7: Deploy OVN-Kubernetes (node0)
 
 ```bash
+cd ~/ovn-kubernetes
+
+# Apply setup (creates namespaces and ConfigMap)
+kubectl apply -f dist/yaml/ovn-setup.yaml
+
+# Fix API server address in ConfigMap
+CORRECT_API_SERVER=$(kubectl config view -o jsonpath='{.clusters[0].cluster.server}' | sed 's|https://||')
+kubectl patch configmap ovn-config -n ovn-kubernetes --type merge -p "{\"data\":{\"k8s_apiserver\":\"${CORRECT_API_SERVER}\"}}"
+
+# Apply RBAC manifests
+kubectl apply -f dist/yaml/rbac-ovnkube-db.yaml
+kubectl apply -f dist/yaml/rbac-ovnkube-master.yaml
+kubectl apply -f dist/yaml/rbac-ovnkube-node.yaml
+
+# Apply OpenVSwitch daemonset (must be first)
+kubectl apply -f dist/yaml/ovs-node.yaml
+
+# Wait for OVS to be ready
+kubectl wait --for=condition=ready pod -l name=ovs-node -n ovn-kubernetes --timeout=120s
+
+# Apply OVN database
+kubectl apply -f dist/yaml/ovnkube-db.yaml
+
+# Wait for database to initialize (60-90 seconds)
+sleep 60
+kubectl wait --for=condition=ready pod -l name=ovnkube-db -n ovn-kubernetes --timeout=180s
+
+# Apply OVN master (control plane)
+kubectl apply -f dist/yaml/ovnkube-master.yaml
+
+# Apply OVN node (data plane)
+kubectl apply -f dist/yaml/ovnkube-node.yaml
+```
+
+---
+
+### Step 8: Verify Deployment
+
+```bash
+# Check pod status
 kubectl get pods -n ovn-kubernetes -o wide
-```
 
-Check nodes (should all be Ready):
-
-```bash
+# Check node status (should now be Ready)
 kubectl get nodes -o wide
+
+# Check logs if issues
+kubectl logs -n ovn-kubernetes -l name=ovnkube-db --all-containers --tail=50
+kubectl logs -n ovn-kubernetes -l name=ovnkube-master --all-containers --tail=50
+kubectl logs -n ovn-kubernetes -l app=ovnkube-node --all-containers --tail=30
 ```
 
-Expected output:
+**Expected result:**
+```
+NAME                READY   STATUS    RESTARTS   AGE
+ovnkube-db-xxx      2/2     Running   0          5m
+ovnkube-master-xxx  2/2     Running   0          4m
+ovnkube-node-xxx    3/3     Running   0          3m
+ovs-node-xxx        1/1     Running   0          6m
+```
+
+**Nodes should be Ready:**
 ```
 NAME     STATUS   ROLES           AGE   VERSION
-node0    Ready    control-plane   ...   v1.29.15
-node1    Ready    <none>          ...   v1.29.15
+node0    Ready    control-plane   30m   v1.29.15
+node1    Ready    <none>          29m   v1.29.15
 ```
-
-**Note:** It may take 1-2 minutes for nodes to transition from NotReady to Ready.
 
 ---
 
@@ -319,148 +314,291 @@ node1    Ready    <none>          ...   v1.29.15
 
 ### Nodes Still NotReady
 
+Check CNI status:
 ```bash
-# Check OVN pod status
 kubectl get pods -n ovn-kubernetes
-
-# View OVN logs
 kubectl logs -n ovn-kubernetes -l app=ovnkube-node --tail=50
-
-# On workers, verify image is loaded in containerd
-sudo ctr -n k8s.io image ls | grep ovn-kube
 ```
 
-### ImagePullBackOff Errors
+### ovnkube-db CrashLoopBackOff
 
-Workers don't have the image **in containerd**. Kubernetes uses containerd (not Docker) as the runtime.
+**Common causes:**
+1. **Port conflicts** - Stale OVN processes on host
+2. **API server discovery issues** - Missing kubectl patch
+3. **Permission issues** - Database directories not writable
 
 **Fix:**
-
 ```bash
-# From your laptop
-scp node0:~/ovn-kube.tar .
-scp ovn-kube.tar node1:~/
+# Kill stale processes
+sudo pkill -9 ovsdb-server ovs-vswitchd ovn-northd ovn-controller
 
-# On worker node
+# Clean up
+kubectl delete namespace ovn-kubernetes
+sudo rm -rf /var/lib/ovn/* /var/run/ovn/* /etc/ovn/*
+
+# On workers too
+ssh node1 "sudo rm -rf /var/lib/ovn/* /var/run/ovn/*"
+
+# Redeploy from Step 7
+```
+
+### API Server Discovery Errors
+
+If you see:
+```
+Error from server (BadRequest): the server rejected our request for an unknown reason
+error validating data: failed to download openapi
+```
+
+**You MUST patch the OVN startup scripts (Step 2):**
+```bash
+cd ~/ovn-kubernetes
+sed -i.bak 's/kubectl apply -f/kubectl apply --validate=false -f/g' dist/images/ovnkube.sh
+sed -i.bak 's/kubectl create -f/kubectl create --validate=false -f/g' dist/images/ovnkube.sh
+
+# REBUILD the image
+cd dist/images
+make ubuntu-image
+docker tag ovn-kube-ubuntu:latest ovn-kube:latest
+docker save ovn-kube:latest -o ~/ovn-kube.tar
+sudo ctr -n k8s.io image import ~/ovn-kube.tar
+
+# Redistribute to workers and redeploy
+```
+
+### ImagePullBackOff on Workers
+
+Workers don't have the image in containerd:
+```bash
+# On worker
+sudo ctr -n k8s.io image ls | grep ovn-kube
+
+# If missing, import it
 sudo ctr -n k8s.io image import ~/ovn-kube.tar
 ```
 
-**Verify:**
+---
+
+## Complete Cleanup
+
+To completely remove OVN and start over:
+
 ```bash
-sudo ctr -n k8s.io image ls | grep ovn-kube
+# Delete Kubernetes resources
+kubectl delete namespace ovn-kubernetes ovn-host-network
+kubectl delete clusterrole ovnkube-db ovnkube-master ovnkube-node ovnkube-node-reader
+kubectl delete clusterrolebinding ovnkube-db ovnkube-master ovnkube-node ovnkube-node-reader
+
+# Clean filesystem on all nodes
+sudo rm -rf /var/lib/ovn/* /var/run/ovn/* /etc/ovn/* /var/log/ovn/*
+ssh node1 "sudo rm -rf /var/lib/ovn/* /var/run/ovn/* /etc/ovn/*"
+ssh node2 "sudo rm -rf /var/lib/ovn/* /var/run/ovn/* /etc/ovn/*"
 ```
 
-### CNI Not Deploying
+---
 
+## Network Configuration
+
+**Default settings:**
+- Pod CIDR: `10.128.0.0/14`
+- Service CIDR: `172.30.0.0/16`
+- MTU: `1400` (default)
+
+**To change CIDRs:**
+1. Modify `node0.sh` before cluster init
+2. Use matching CIDRs in `daemonset.sh --net-cidr` and `--svc-cidr`
+
+---
+
+## Quick Reference
+
+### Cluster Setup
 ```bash
-# Check manifests directory
-ls -lh ~/ovn-kubernetes/dist/yaml/
+# On all nodes
+./all.sh && newgrp docker
 
-# Re-deploy
-kubectl delete -f ~/ovn-kubernetes/dist/yaml/ovnkube-node.yaml  # if exists
-./deploy-ovn-cni.sh
+# On node0
+./node0.sh
+cat join.sh  # Copy this command
+
+# On each worker
+./worker.sh "<join command>"
 ```
 
-### CRD Validation Errors
-
-Some CRDs may fail to apply due to Kubernetes version compatibility (e.g., `userdefinednetworks.k8s.ovn.org` with CEL validation). This is **expected** and won't affect basic CNI functionality. The core OVN manifests will still deploy successfully.
-
-### Manifest Generation Fails (Template Not Found)
-
-If you see errors like `jinja2.exceptions.TemplateNotFound: ../templates/ovnkube-node.yaml.j2`:
-
-**Cause:** The jinjanate command can't find the Jinja2 template files.
-
-**Fix:**
-The `deploy-ovn-cni.sh` script now handles this automatically by:
-1. Installing jinjanator if missing
-2. Setting the correct PATH to include `~/.local/bin`
-3. Running daemonset.sh from the correct directory
-
-**Manual fix if needed:**
+### OVN-Kubernetes Deployment
 ```bash
-# Ensure jinjanator is installed
-pip3 install --user jinjanator
+# On node0
+cd ~
+git clone git@github.com:Anirudh-R-1201/ovn-kubernetes.git
+cd ovn-kubernetes
+git checkout nw-affinity
 
-# Add to PATH
-export PATH="${HOME}/.local/bin:${PATH}"
+# Patch (CRITICAL)
+sed -i 's/kubectl apply -f/kubectl apply --validate=false -f/g' dist/images/ovnkube.sh
 
-# Verify installation
-jinjanate --version
+# Build and distribute
+cd dist/images && make ubuntu-image
+docker tag ovn-kube-ubuntu:latest ovn-kube:latest
+docker save ovn-kube:latest -o ~/ovn-kube.tar
+sudo ctr -n k8s.io image import ~/ovn-kube.tar
 
-# Re-run deployment
-./deploy-ovn-cni.sh
-```
+# Distribute to workers (from laptop)
+scp node0:~/ovn-kube.tar . && scp ovn-kube.tar node1:~/
+ssh node1 "sudo ctr -n k8s.io image import ~/ovn-kube.tar"
 
-### No Manifests in dist/yaml/
+# Generate manifests
+cd ~/ovn-kubernetes/dist/images
+./daemonset.sh --image=ovn-kube:latest --net-cidr=10.128.0.0/14 --svc-cidr=172.30.0.0/16
 
-If the `dist/yaml/` directory is empty after running deploy script:
+# Prepare directories on all nodes
+sudo mkdir -p /var/lib/ovn/etc /var/lib/ovn/data && sudo chmod 755 /var/lib/ovn /var/lib/ovn/etc /var/lib/ovn/data
+ssh node1 "sudo mkdir -p /var/lib/ovn/etc /var/lib/ovn/data && sudo chmod 755 /var/lib/ovn /var/lib/ovn/etc /var/lib/ovn/data"
 
-**Check:**
-```bash
-# Verify daemonset.sh exists
-ls -la ~/ovn-kubernetes/dist/images/daemonset.sh
-
-# Check for template files
-ls -la ~/ovn-kubernetes/dist/templates/
-
-# Try running manually from correct directory
+# Deploy
 cd ~/ovn-kubernetes
-./dist/images/daemonset.sh --image=ovn-kube:latest \
-  --net-cidr=10.128.0.0/14 \
-  --svc-cidr=172.30.0.0/16 \
-  --kind=kind
+kubectl apply -f dist/yaml/ovn-setup.yaml
+kubectl patch configmap ovn-config -n ovn-kubernetes --type merge -p "{\"data\":{\"k8s_apiserver\":\"$(kubectl config view -o jsonpath='{.clusters[0].cluster.server}' | sed 's|https://||')\"}}"
+kubectl apply -f dist/yaml/rbac-ovnkube-db.yaml
+kubectl apply -f dist/yaml/rbac-ovnkube-master.yaml
+kubectl apply -f dist/yaml/rbac-ovnkube-node.yaml
+kubectl apply -f dist/yaml/ovs-node.yaml
+kubectl wait --for=condition=ready pod -l name=ovs-node -n ovn-kubernetes --timeout=120s
+kubectl apply -f dist/yaml/ovnkube-db.yaml
+sleep 60
+kubectl apply -f dist/yaml/ovnkube-master.yaml
+kubectl apply -f dist/yaml/ovnkube-node.yaml
+
+# Verify
+kubectl get nodes
+kubectl get pods -n ovn-kubernetes
 ```
 
 ---
 
-## Customization
+## stage1-baseline: Kind-Based Testing
 
-**Use different branch:**
+For quick testing without CloudLab cluster issues, use the Kind-based setup:
+
 ```bash
-OVN_BRANCH=master ./install-ovn-cni.sh
+cd ~/CSCI599/stage1-baseline
+./00-localonly-kind-ovn-upstream.sh
 ```
 
-**Change Pod/Service CIDRs:**
+This creates a self-contained Kind cluster with upstream OVN-Kubernetes.
 
-Edit the scripts and modify:
+**Baseline workflow:**
 ```bash
-POD_CIDR="10.128.0.0/14"
-SVC_CIDR="172.30.0.0/16"
+# 1. Create cluster
+./00-localonly-kind-ovn-upstream.sh
+
+# 2. Deploy workload
+./02-deploy-workload.sh
+
+# 3. Generate load
+./03-generate-self-similar-load.sh
+
+# 4. Collect results
+./04-collect-baseline.sh
+
+# 5. Snapshot placement
+./05-snapshot-pod-placement.sh
 ```
 
+---
 
+## Important Notes
+
+### 1. kubectl --validate=false Patch
+
+**This is CRITICAL for CloudLab deployments.**
+
+Without this patch, you'll see:
+```
+Error from server (BadRequest): the server rejected our request for an unknown reason
+Failed to create endpoint for ovnkube-db service
+```
+
+The patch MUST be applied before building the image (Step 2).
+
+### 2. Image Distribution
+
+- Kubernetes uses **containerd** (not Docker) as the runtime
+- Images MUST be imported with: `sudo ctr -n k8s.io image import`
+- Do NOT use `docker load` on worker nodes
+
+### 3. Deployment Order
+
+The order matters:
+1. ovn-setup (namespaces)
+2. RBAC manifests
+3. ovs-node (OpenVSwitch first)
+4. ovnkube-db (database must be ready)
+5. ovnkube-master (control plane)
+6. ovnkube-node (data plane)
+
+### 4. Node Communication
+
+- Nodes communicate via internal IPs (usually `128.110.217.x`)
+- SSH between nodes may require key setup
+- Or distribute images via your laptop as intermediary
 
 ---
 
+## Advanced
 
+### Rebuild After Code Changes
 
+```bash
+cd ~/ovn-kubernetes
+git pull origin nw-affinity
 
+# Reapply the kubectl patch
+sed -i 's/kubectl apply -f/kubectl apply --validate=false -f/g' dist/images/ovnkube.sh
 
-## **Notes**
+# Rebuild
+cd dist/images && make ubuntu-image
+docker tag ovn-kube-ubuntu:latest ovn-kube:latest
+docker save ovn-kube:latest -o ~/ovn-kube.tar
+sudo ctr -n k8s.io image import ~/ovn-kube.tar
 
+# Redistribute to workers
+# ... (use laptop or SSH)
 
+# Clean old deployment
+kubectl delete namespace ovn-kubernetes
+sudo rm -rf /var/lib/ovn/*
 
-
-
-**Script Improvements:**
-- Persistent sysctl and kernel module settings survive reboots
-- Swap disable is persistent across reboots  
-- kubelet service properly started after installation
-- All networking settings configured for production use
-
-**Usage:**
-- kubectl is intended to be used **only on node0**
-- Worker nodes do not have admin kubeconfig by default
-- Do not interrupt kubeadm join operations
-- containerd is required for Kubernetes v1.29
-- Always use the same IP for kubeadm init and kubeadm join
-
-
-
-
+# Redeploy (Step 7 from Part 2)
+```
 
 ---
 
+## Quick Commands
 
+```bash
+# Cluster status
+kubectl get nodes
+kubectl get pods -A
 
+# OVN status
+kubectl get pods -n ovn-kubernetes -o wide
+kubectl logs -n ovn-kubernetes -l name=ovnkube-db -c nb-ovsdb --tail=50
+kubectl logs -n ovn-kubernetes -l name=ovnkube-db -c sb-ovsdb --tail=50
+
+# Restart OVN components
+kubectl rollout restart -n ovn-kubernetes deployment/ovnkube-db
+kubectl rollout restart -n ovn-kubernetes deployment/ovnkube-master
+kubectl rollout restart -n ovn-kubernetes daemonset/ovnkube-node
+
+# Complete cleanup
+kubectl delete namespace ovn-kubernetes
+sudo rm -rf /var/lib/ovn/* /var/run/ovn/*
+```
+
+---
+
+## References
+
+- [OVN-Kubernetes Documentation](https://github.com/ovn-org/ovn-kubernetes)
+- [Kubernetes Documentation](https://kubernetes.io/docs/)
+- [kubeadm Setup](https://kubernetes.io/docs/setup/production-environment/tools/kubeadm/)
