@@ -2,8 +2,8 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-CLUSTER_NAME="${CLUSTER_NAME:-ovn-baseline}"
-KUBECONFIG_PATH="${KUBECONFIG_PATH:-${ROOT_DIR}/kubeconfig-${CLUSTER_NAME}}"
+CLUSTER_NAME="${CLUSTER_NAME:-cloudlab-cluster}"
+KUBECONFIG_PATH="${KUBECONFIG_PATH:-$HOME/.kube/config}"
 
 INTERVAL_SEC="${INTERVAL_SEC:-30}"
 COUNT="${COUNT:-20}"
