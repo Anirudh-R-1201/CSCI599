@@ -12,7 +12,7 @@ This guide describes how to provision a multi-node Kubernetes cluster on CloudLa
 - SSH access to all nodes
 - Internet connectivity on all nodes
 - Git access to `Anirudh-R-1201/ovn-kubernetes` (nw-affinity branch)
-
+git clone https://github.com/Anirudh-R-1201/CSCI599.git
 ---
 
 ## Part 1: Kubernetes Cluster Setup
@@ -125,7 +125,7 @@ echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.profile
 cd ~
 git clone https://github.com/Anirudh-R-1201/ovn-kubernetes.git
 cd ovn-kubernetes
-git checkout <branch>
+#git checkout <branch>
 
 # CRITICAL: Patch kubectl commands to fix API server discovery issues
 sed -i.bak 's/ apply -f/ apply --validate=false -f/g' dist/images/ovnkube.sh

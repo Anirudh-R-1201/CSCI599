@@ -5,7 +5,7 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CLUSTER_NAME="${CLUSTER_NAME:-cloudlab-cluster}"
 KUBECONFIG_PATH="${KUBECONFIG_PATH:-$HOME/.kube/config}"
 
-INTERVAL_SEC="${INTERVAL_SEC:-30}"
+INTERVAL_SEC="${INTERVAL_SEC:-2}"
 COUNT="${COUNT:-20}"
 
 RUN_ID="${RUN_ID:-$(date +"%Y%m%d-%H%M%S")}"
