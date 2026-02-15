@@ -101,17 +101,23 @@ kubectl get hpa -w
 ./04-collect-baseline.sh
 ```
 
-### 4. Generate Graphs
+### 4. Generate Graphs and Analysis
 
 ```bash
 # Install matplotlib if needed
 pip3 install matplotlib
 
-# Generate all visualization graphs (uses latest run by default)
+# Generate load test visualization graphs (uses latest run by default)
 ./06-generate-graphs.sh
 
 # Or specify a specific run
 ./06-generate-graphs.sh data/20260214-191727
+
+# Analyze detailed network data (if using 03d script)
+./07-analyze-network-data.py
+
+# Or specify run
+./07-analyze-network-data.py data/20260214-191727
 ```
 
 Load Test Scripts
@@ -194,6 +200,11 @@ BURSTS=40 BASE_QPS=30 MAX_QPS=200 THREADS=24 ./03b-multiservice-load.sh
 # Runs 3 load generators in parallel targeting different endpoints
 # Total QPS: 240, Total threads: 72
 DURATION=600 QPS_HOME=100 QPS_PRODUCT=80 QPS_CART=60 THREADS_PER_ENDPOINT=24 ./03c-concurrent-multiservice-load.sh
+
+# Option C: Detailed network analysis (COMPREHENSIVE)
+# Concurrent load + detailed pod-to-pod latency + network stats
+# Samples every 10s: pod locations, service endpoints, pod-to-pod latencies
+DURATION=600 SAMPLE_INTERVAL=10 ./03d-detailed-network-analysis.sh
 ```
 
 **Endpoint Mapping (what each endpoint exercises):**
@@ -201,24 +212,49 @@ DURATION=600 QPS_HOME=100 QPS_PRODUCT=80 QPS_CART=60 THREADS_PER_ENDPOINT=24 ./0
 - **Product** (`/product/<id>`): productcatalog, recommendation, currency (heavy)
 - **Cart** (`/cart`): cart, currency (heavy)
 
-**Quick Command for Maximum Backend Scaling:**
+**Network Analysis Features (03d):**
+- Pod-to-pod latency measurements (curl time between pods)
+- Pod placement tracking (which pods on which nodes)
+- Service endpoint distribution over time
+- Node network information and capacity
+- OVN-Kubernetes CNI metrics (if available)
+- Service mesh topology
 
+**Quick Commands:**
+
+**Maximum Backend Scaling:**
 ```bash
-# Delete old HPAs and set low threshold
 kubectl delete hpa --all
 CPU_THRESHOLD=15 ./07-setup-hpa.sh
 
-# Run concurrent load with pod placement monitoring
 export RUN_ID=$(date +"%Y%m%d-%H%M%S")
 INTERVAL_SEC=5 COUNT=200 ./05-snapshot-pod-placement.sh > /tmp/placement.log 2>&1 &
 PLACEMENT_PID=$!
 
-# 10-minute high-intensity concurrent test
 DURATION=600 QPS_HOME=100 QPS_PRODUCT=80 QPS_CART=60 THREADS_PER_ENDPOINT=24 ./03c-concurrent-multiservice-load.sh
 
 kill $PLACEMENT_PID
 ./04-collect-baseline.sh
 ./06-generate-graphs.sh
+```
+
+**Comprehensive Network Analysis:**
+```bash
+kubectl delete hpa --all
+CPU_THRESHOLD=15 ./07-setup-hpa.sh
+
+# Run detailed network analysis (includes load test + monitoring)
+DURATION=600 SAMPLE_INTERVAL=10 QPS_HOME=100 QPS_PRODUCT=80 QPS_CART=60 THREADS_PER_ENDPOINT=24 ./03d-detailed-network-analysis.sh
+
+# Analyze results
+./06-generate-graphs.sh
+./07-analyze-network-data.py
+
+# View network analysis reports
+LATEST=$(ls -t data/ | head -1)
+cat data/$LATEST/network-analysis/analysis-summary.txt
+cat data/$LATEST/network-analysis/pod-placement-analysis.txt
+cat data/$LATEST/network-analysis/pod-latency-analysis.txt
 ```
 
 Results
@@ -233,6 +269,18 @@ data/<timestamp>/
 ├── pod-placement/
 │   ├── index.jsonl               # Snapshot timestamps
 │   └── pods-*.json               # Pod distribution over time
+├── network-analysis/            # (if using 03d script)
+│   ├── pod-network-*.json        # Pod locations and IPs per sample
+│   ├── service-endpoints-*.json  # Service endpoint mappings
+│   ├── pod-latency-*.txt         # Pod-to-pod latency measurements
+│   ├── node-network-*.json       # Node network info and capacity
+│   ├── service-metrics-*.json    # Service definitions and ClusterIPs
+│   ├── monitoring.log            # Monitoring process log
+│   ├── analysis-summary.txt      # Quick analysis summary
+│   ├── pod-placement-analysis.txt       # Detailed pod placement report
+│   ├── pod-latency-analysis.txt         # Latency analysis report
+│   ├── service-topology-analysis.txt    # Service topology report
+│   └── pod-distribution-timeline.png    # Pod distribution graph
 ├── baseline/
 │   ├── latency-summary.json      # Aggregated latencies
 │   ├── service-graph.json        # Service topology
