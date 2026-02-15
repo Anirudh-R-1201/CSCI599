@@ -1,232 +1,299 @@
-Stage 1: Baseline (OVN-Kubernetes on CloudLab)
-===============================================
+Stage 1: Baseline Testing
+==========================
 
-Goal
-----
-Establish a reproducible baseline for pod placement, inter-service communication, 
-and latency using OVN-Kubernetes CNI on a CloudLab bare-metal cluster. This stage 
-uses the baseline CNI configuration without network-aware scheduling or custom 
-modifications.
-
-Environment
------------
-- Multi-node bare-metal CloudLab cluster (Ubuntu 22.04)
-- Physical node isolation (vs containerized nodes in Kind)
-- Real network hardware and fabric
-- OVN-Kubernetes CNI deployed from custom build
-- Results reflect actual production-like latency characteristics
+Capture baseline latency and pod placement metrics using OVN-Kubernetes on CloudLab.
 
 Prerequisites
 -------------
-- Working CloudLab Kubernetes cluster (see main README Part 1)
-- OVN-Kubernetes CNI deployed and healthy (see main README Part 2)
-- All nodes in Ready state
-- DNS working on all nodes
-- kubectl configured on control plane (node0)
-- Python3, jq installed on node0
+- Kubernetes cluster with OVN-Kubernetes deployed (see main README)
+- All nodes in Ready state with DNS configured
+- Python3, jq, and matplotlib installed on node0
+- For autoscaling tests: metrics-server deployed
 
-CloudLab-Specific Setup
------------------------
-Before running baseline tests, ensure:
+Running Tests
+-------------
 
-1. **DNS is configured on ALL nodes:**
-   ```bash
-   # On each node (node0, node1, node2, ...)
-   sudo bash -c 'cat > /etc/resolv.conf << EOF
-   nameserver 8.8.8.8
-   nameserver 8.8.4.4
-   nameserver 1.1.1.1
-   EOF'
-   ```
-
-2. **OVN-Kubernetes is healthy:**
-   ```bash
-   kubectl get pods -n ovn-kubernetes -o wide
-   # All ovnkube-node pods should be 3/3 Running
-   # All nodes should be Ready
-   ```
-
-3. **Container registry access works:**
-   ```bash
-   # Test from a worker node
-   ssh node1 "curl -I https://gcr.io"
-   ```
-
-Step-by-Step: Running Baseline Tests
--------------------------------------
-
-### 1. Deploy Online Boutique Workload
+### Quick Start: Complete Autoscaling Test
 
 ```bash
 cd ~/CSCI599/stage1-baseline
 
-# Set kubeconfig path
-export KUBECONFIG_PATH=~/.kube/config
-export CLUSTER_NAME="cloudlab-cluster"
+# Run complete workflow (setup, test, collect, analyze)
+./run-autoscaling-test.sh
+```
 
-# Deploy the microservices application
+This automated script will:
+1. Verify prerequisites and install metrics-server if needed
+2. Deploy Online Boutique workload
+3. Configure HorizontalPodAutoscalers (25% CPU threshold)
+4. Run high-intensity load test (50 bursts, ~60-90 minutes)
+5. Collect all baseline metrics
+6. Generate visualization graphs
+
+### Manual Step-by-Step
+
+### 1. Deploy Workload
+
+```bash
+cd ~/CSCI599/stage1-baseline
+
 kubectl apply -f online-boutique.yaml
-
-# Wait for all pods to be Running (may take 2-5 minutes)
 kubectl wait --for=condition=Available deployment --all -n default --timeout=600s
-
-# Verify deployment
 kubectl get pods -o wide
 ```
 
-**Expected:** 12 microservices pods running across worker nodes (node1, node2, ...)
+### 2. Run Load Test with Pod Placement Monitoring
 
-### 2. Generate Self-Similar Load
-
+**Option A: Basic Load Test (no autoscaling)**
 ```bash
-# Run load generation (15-30 minutes)
-./03-generate-self-similar-load.sh
+export RUN_ID=$(date +"%Y%m%d-%H%M%S")
 
-# This will:
-# - Deploy Fortio load generator pod
-# - Generate 30 Pareto-distributed traffic bursts
-# - Target frontend service (exercises east-west microservices traffic)
-# - Store results in stage1-baseline/data/<timestamp>/loadgen/
+# Start pod placement monitoring (5s intervals, ~42min max)
+INTERVAL_SEC=5 COUNT=500 ./05-snapshot-pod-placement.sh > /tmp/placement.log 2>&1 &
+PLACEMENT_PID=$!
+
+# Run load generation (30 bursts, ~15-30 minutes)
+BURSTS=30 BASE_QPS=5 MAX_QPS=80 BASE_DURATION=10 MAX_DURATION=40 ./03-generate-self-similar-load.sh
+
+# Stop placement monitoring
+kill $PLACEMENT_PID
 ```
 
-**Parameters (can be customized):**
-- `BURSTS=30` - Number of traffic bursts
-- `BASE_QPS=5` - Minimum queries per second
-- `MAX_QPS=80` - Maximum queries per second
-- `BASE_DURATION=10` - Minimum burst duration (seconds)
-- `MAX_DURATION=40` - Maximum burst duration (seconds)
+**Option B: High-Intensity Load Test (with autoscaling)**
+```bash
+# Install metrics-server (required for HPA)
+kubectl apply -f https://github.com/kubernetes-sigs/metrics-server/releases/latest/download/components.yaml
+kubectl patch deployment metrics-server -n kube-system --type='json' \
+  -p='[{"op": "add", "path": "/spec/template/spec/containers/0/args/-", "value": "--kubelet-insecure-tls"}]'
+
+# Wait for metrics-server to be ready
+kubectl wait --for=condition=Available deployment/metrics-server -n kube-system --timeout=120s
+
+# Setup HPA with lower threshold for better backend scaling (15% CPU threshold)
+CPU_THRESHOLD=25 ./07-setup-hpa.sh
+
+# Run high-intensity load test
+export RUN_ID=$(date +"%Y%m%d-%H%M%S")
+
+INTERVAL_SEC=5 COUNT=1000 ./05-snapshot-pod-placement.sh > /tmp/placement.log 2>&1 &
+PLACEMENT_PID=$!
+
+# Choose one of these load patterns:
+
+# Pattern 1: Single endpoint, high load
+BURSTS=50 BASE_QPS=20 MAX_QPS=300 BASE_DURATION=30 MAX_DURATION=120 THREADS=32 ./03-generate-self-similar-load.sh
+
+# Pattern 2: Multi-endpoint, rotating (better backend coverage)
+BURSTS=40 BASE_QPS=30 MAX_QPS=200 BASE_DURATION=60 MAX_DURATION=120 THREADS=24 ./03b-multiservice-load.sh
+
+# Pattern 3: Concurrent multi-endpoint (BEST for backend scaling)
+DURATION=600 QPS_HOME=100 QPS_PRODUCT=80 QPS_CART=60 THREADS_PER_ENDPOINT=24 ./03c-concurrent-multiservice-load.sh
+
+kill $PLACEMENT_PID
+
+# Monitor HPA during test (in another terminal)
+kubectl get hpa -w
+```
 
 ### 3. Collect Baseline Metrics
 
 ```bash
-# Collect cluster state and metrics
 ./04-collect-baseline.sh
-
-# This captures:
-# - Pod placement snapshots
-# - Node configurations
-# - Service topology graph
-# - Latency percentiles (p50, p95, p99, p99.9)
-# - Network endpoint mappings
 ```
 
-### 4. (Optional) Continuous Placement Monitoring
+### 4. Generate Graphs
 
 ```bash
-# Run in background to capture placement changes over time
-./05-snapshot-pod-placement.sh &
+# Install matplotlib if needed
+pip3 install matplotlib
+
+# Generate all visualization graphs (uses latest run by default)
+./06-generate-graphs.sh
+
+# Or specify a specific run
+./06-generate-graphs.sh data/20260214-191727
 ```
 
-Artifacts
----------
-All data is written to `stage1-baseline/data/<YYYYMMDD-HHMMSS>/`:
+Load Test Scripts
+-----------------
+
+**Three load generation strategies:**
+
+| Script | Best For | Backend Scaling | Complexity |
+|--------|----------|-----------------|------------|
+| `03-generate-self-similar-load.sh` | Baseline tests, frontend-focused | Minimal | Simple |
+| `03b-multiservice-load.sh` | Varied traffic patterns, sequential | Moderate | Medium |
+| `03c-concurrent-multiservice-load.sh` | **Maximum backend scaling** | **Excellent** | Simple |
+
+**Recommendation:** Use `03c-concurrent-multiservice-load.sh` for autoscaling tests.
+
+Load Test Parameters
+--------------------
+
+**Single Endpoint Load (03-generate-self-similar-load.sh):**
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `BURSTS` | 30 | Number of traffic bursts |
+| `BASE_QPS` | 5 | Minimum queries per second |
+| `MAX_QPS` | 80 | Maximum queries per second |
+| `BASE_DURATION` | 10 | Minimum burst duration (seconds) |
+| `MAX_DURATION` | 40 | Maximum burst duration (seconds) |
+| `THREADS` | 4 | Concurrent connections (higher = more load) |
+
+**Multi-Service Load (03b-multiservice-load.sh):**
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `BURSTS` | 30 | Number of bursts (rotates endpoints) |
+| `BASE_QPS` | 10 | Minimum queries per second |
+| `MAX_QPS` | 150 | Maximum queries per second |
+| `THREADS` | 16 | Concurrent connections per endpoint |
+
+**Concurrent Load (03c-concurrent-multiservice-load.sh):**
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `DURATION` | 300 | Total test duration (seconds) |
+| `QPS_HOME` | 100 | QPS for home endpoint |
+| `QPS_PRODUCT` | 80 | QPS for product endpoint |
+| `QPS_CART` | 60 | QPS for cart endpoint |
+| `THREADS_PER_ENDPOINT` | 24 | Threads per endpoint (72 total) |
+
+**HPA Configuration:**
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `CPU_THRESHOLD` | 25 | HPA CPU % threshold for scaling |
+| `MIN_REPLICAS` | 1 | Minimum replicas per service |
+| `MAX_REPLICAS` | 8 | Maximum replicas per service |
+
+**Example Configurations:**
+
+```bash
+# Light load (no scaling expected)
+BURSTS=20 BASE_QPS=5 MAX_QPS=50 THREADS=4 ./03-generate-self-similar-load.sh
+
+# Medium load (some scaling)
+BURSTS=30 BASE_QPS=10 MAX_QPS=150 THREADS=16 ./03-generate-self-similar-load.sh
+
+# Heavy load (significant scaling)
+BURSTS=50 BASE_QPS=20 MAX_QPS=300 THREADS=32 ./03-generate-self-similar-load.sh
+```
+
+**Multi-Service Load Scripts (Better Backend Scaling):**
+
+To force backend services to scale, use scripts that exercise different services more directly:
+
+```bash
+# Option A: Sequential bursts across different endpoints
+# Rotates between home, product, cart endpoints to exercise different backends
+BURSTS=40 BASE_QPS=30 MAX_QPS=200 THREADS=24 ./03b-multiservice-load.sh
+
+# Option B: Concurrent load on multiple endpoints (MAXIMUM BACKEND STRESS)
+# Runs 3 load generators in parallel targeting different endpoints
+# Total QPS: 240, Total threads: 72
+DURATION=600 QPS_HOME=100 QPS_PRODUCT=80 QPS_CART=60 THREADS_PER_ENDPOINT=24 ./03c-concurrent-multiservice-load.sh
+```
+
+**Endpoint Mapping (what each endpoint exercises):**
+- **Home** (`/`): productcatalog, recommendation, ad, cart
+- **Product** (`/product/<id>`): productcatalog, recommendation, currency (heavy)
+- **Cart** (`/cart`): cart, currency (heavy)
+
+**Quick Command for Maximum Backend Scaling:**
+
+```bash
+# Delete old HPAs and set low threshold
+kubectl delete hpa --all
+CPU_THRESHOLD=15 ./07-setup-hpa.sh
+
+# Run concurrent load with pod placement monitoring
+export RUN_ID=$(date +"%Y%m%d-%H%M%S")
+INTERVAL_SEC=5 COUNT=200 ./05-snapshot-pod-placement.sh > /tmp/placement.log 2>&1 &
+PLACEMENT_PID=$!
+
+# 10-minute high-intensity concurrent test
+DURATION=600 QPS_HOME=100 QPS_PRODUCT=80 QPS_CART=60 THREADS_PER_ENDPOINT=24 ./03c-concurrent-multiservice-load.sh
+
+kill $PLACEMENT_PID
+./04-collect-baseline.sh
+./06-generate-graphs.sh
+```
+
+Results
+-------
+All data saved to `stage1-baseline/data/<YYYYMMDD-HHMMSS>/`:
 
 ```
 data/<timestamp>/
 ├── loadgen/
-│   ├── bursts.jsonl              # Load generation schedule
-│   ├── fortio-burst-*.json       # Detailed latency data per burst
-│   ├── fortio-burst-*.log        # Load generator logs
-│   └── ...
-└── baseline/
-    ├── nodes.json                # Node configurations
-    ├── pods.json                 # Pod placement details
-    ├── pods.txt                  # Human-readable pod list
-    ├── services.yaml             # Service definitions
-    ├── endpoints.yaml            # Service endpoints
-    ├── deployments.yaml          # Deployment configs
-    ├── service-graph.json        # Microservices topology
-    ├── service-graph.csv         # Topology in CSV format
-    └── latency-summary.txt       # Aggregated latency metrics
+│   ├── bursts.jsonl              # Load schedule
+│   └── fortio-burst-*.json       # Latency data (p50, p95, p99, p99.9)
+├── pod-placement/
+│   ├── index.jsonl               # Snapshot timestamps
+│   └── pods-*.json               # Pod distribution over time
+├── baseline/
+│   ├── latency-summary.json      # Aggregated latencies
+│   ├── service-graph.json        # Service topology
+│   ├── pods.txt                  # Pod placement
+│   └── nodes.json                # Cluster configuration
+└── graphs/
+    ├── latency_percentiles.png   # p50/p95/p99/p99.9 over time
+    ├── qps_comparison.png        # Requested vs actual QPS
+    ├── latency_vs_qps.png        # Latency correlation with QPS
+    ├── latency_distribution.png  # Box plot of latency distribution
+    ├── pod_distribution.png      # Pod placement over time
+    └── summary_stats.txt         # Summary statistics
 ```
 
-Troubleshooting
----------------
+Quick Analysis
+--------------
 
-### Pods Stuck in ContainerCreating
+### View Graphs
 
-**Cause:** DNS not configured on worker nodes
-
-**Fix:**
 ```bash
-# On each worker node
-ssh node1 "sudo bash -c 'cat > /etc/resolv.conf << EOF
-nameserver 8.8.8.8
-nameserver 8.8.4.4
-EOF'"
+cd ~/CSCI599/stage1-baseline
+LATEST=$(ls -t data/ | head -1)
 
-# Restart containerd and kubelet
-ssh node1 "sudo systemctl restart containerd && sleep 5 && sudo systemctl restart kubelet"
+# Open graphs directory
+open data/$LATEST/graphs/
+
+# View summary statistics
+cat data/$LATEST/graphs/summary_stats.txt
 ```
 
-### Pods Stuck in ImagePullBackOff
+### Check Autoscaling Results
 
-**Cause:** Registry cannot be reached due to DNS or network issues
-
-**Fix:**
 ```bash
-# Test connectivity from worker
-ssh node1 "nslookup gcr.io"
-ssh node1 "curl -I https://gcr.io"
+# View HPA status
+kubectl get hpa
 
-# If DNS fails, fix as above
+# Check final replica counts
+kubectl get deployments -o wide | grep -E 'frontend|productcatalog|recommendation|checkout|cart'
+
+# View scaling events
+kubectl get events --sort-by='.lastTimestamp' | grep -i "scaled"
 ```
 
-### CNI Socket Connection Refused
+### Manual Data Analysis
 
-**Cause:** ovnkube-node pods not healthy
-
-**Fix:**
 ```bash
-# Check OVN pod status
-kubectl get pods -n ovn-kubernetes -o wide
+# View latency summary
+cat data/$LATEST/baseline/latency-summary.json | jq '.bursts[] | {burst: .file, p50: .p50_s, p95: .p95_s, p99: .p99_s}'
 
-# If not 3/3 Running, restart them
-kubectl delete pod -n ovn-kubernetes -l app=ovnkube-node
+# View pod distribution over time (should show variance with autoscaling)
+for i in {1..20}; do
+  echo -n "Snapshot $i: "
+  cat data/$LATEST/pod-placement/pods-$i.json | jq -r '.items[] | select(.metadata.namespace=="default") | .spec.nodeName' | sort | uniq -c
+done
 
-# Wait for them to come back up
-kubectl get pods -n ovn-kubernetes -w
+# Average p95 latency
+cat data/$LATEST/baseline/latency-summary.json | jq '[.bursts[].p95_s] | add/length'
+
+# Count unique pod counts per service (shows scaling activity)
+cat data/$LATEST/pod-placement/index.jsonl | while read line; do
+  file=$(echo $line | jq -r '.file')
+  cat data/$LATEST/pod-placement/$file | jq -r '.items[] | select(.metadata.namespace=="default") | select(.metadata.labels.app=="frontend") | .metadata.name' | wc -l
+done | sort -u
 ```
-
-### Load Generator Fails
-
-**Cause:** Frontend service not accessible
-
-**Fix:**
-```bash
-# Check if frontend pod is running
-kubectl get pods -l app=frontend
-
-# Check service
-kubectl get svc frontend
-
-# Test connectivity from load generator pod
-kubectl exec -it fortio-loadgen -- curl frontend:80
-```
-
-Comparing Results
------------------
-To compare baseline with network-aware scheduling:
-
-1. Save baseline results: `mv data/<timestamp> data/baseline-vanilla/`
-2. Deploy network-aware OVN-Kubernetes
-3. Re-run steps 1-3
-4. Compare latency metrics in `baseline/latency-summary.txt`
-
-Expected Metrics
-----------------
-On a typical 3-node CloudLab cluster with Online Boutique:
-
-- **p50 latency:** 10-50ms
-- **p95 latency:** 50-200ms
-- **p99 latency:** 100-500ms
-- **Pod count:** ~12 microservices + 1 load generator
-- **Inter-node traffic:** Significant east-west calls between services
-
-Notes
------
-- Results reflect bare-metal performance (more realistic than Kind)
-- Network latency includes physical switch fabric
-- Pod placement is controlled by default Kubernetes scheduler
-- No network-aware optimizations in this baseline
-- Use these metrics to measure improvements from network-aware scheduling

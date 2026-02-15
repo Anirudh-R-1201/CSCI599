@@ -13,6 +13,7 @@ MAX_DURATION="${MAX_DURATION:-40}"
 ALPHA_QPS="${ALPHA_QPS:-1.5}"
 ALPHA_DURATION="${ALPHA_DURATION:-1.4}"
 MAX_SLEEP="${MAX_SLEEP:-20}"
+THREADS="${THREADS:-4}"  # Concurrent connections (higher = more backend load)
 
 RUN_ID="${RUN_ID:-$(date +"%Y%m%d-%H%M%S")}"
 DATA_DIR_BASE="${ROOT_DIR}/data/${RUN_ID}"
@@ -68,7 +69,7 @@ while read -r line; do
   JSON_FILE="${DATA_DIR}/fortio-burst-${idx}.json"
 
   kubectl --kubeconfig "${KUBECONFIG_PATH}" exec fortio-loadgen -- \
-    fortio load -qps "${qps}" -t "${dur}s" -p "50,95,99,99.9" \
+    fortio load -c "${THREADS}" -qps "${qps}" -t "${dur}s" -p "50,95,99,99.9" \
     -abort-on -1 -allow-initial-errors -json - -labels "stage1-burst-${idx}" \
     http://frontend:80/ > "${JSON_FILE}" 2> "${LOG_FILE}"
 

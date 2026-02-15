@@ -12,7 +12,14 @@ This guide describes how to provision a multi-node Kubernetes cluster on CloudLa
 - SSH access to all nodes
 - Internet connectivity on all nodes
 - Git access to `Anirudh-R-1201/ovn-kubernetes` (nw-affinity branch)
+
+**Clone this repository:**
+```bash
 git clone https://github.com/Anirudh-R-1201/CSCI599.git
+cd CSCI599
+```
+
+**IMPORTANT:** CloudLab nodes have DNS issues that must be fixed **before** proceeding. See Step 5 in Part 1 below.
 ---
 
 ## Part 1: Kubernetes Cluster Setup
@@ -93,6 +100,90 @@ kubectl get nodes
 kubectl get pods -A
 # Only kube-system pods will be running
 ```
+
+---
+
+### Step 5: Fix DNS Permanently (ALL Nodes) - CRITICAL
+
+**CloudLab Issue:** systemd-resolved often fails on CloudLab, causing DNS resolution to break. This prevents image pulls and API server access.
+
+**Fix DNS permanently on ALL nodes before proceeding:**
+
+**On each node (node0, node1, node2, ...):**
+
+```bash
+# Stop systemd-resolved from managing DNS
+sudo systemctl stop systemd-resolved
+sudo systemctl disable systemd-resolved
+
+# Remove the symlink
+sudo rm -f /etc/resolv.conf
+
+# Create a real DNS configuration file
+sudo bash -c 'cat > /etc/resolv.conf << EOF
+nameserver 8.8.8.8
+nameserver 8.8.4.4
+nameserver 1.1.1.1
+search utah.cloudlab.us
+EOF'
+
+# Make it immutable (prevents systemd from overwriting)
+sudo chattr +i /etc/resolv.conf
+
+# Test DNS
+nslookup google.com
+```
+
+**From node0, fix all nodes at once:**
+
+```bash
+# Fix node0 (local)
+sudo systemctl stop systemd-resolved
+sudo systemctl disable systemd-resolved
+sudo rm -f /etc/resolv.conf
+sudo bash -c 'cat > /etc/resolv.conf << EOF
+nameserver 8.8.8.8
+nameserver 8.8.4.4
+nameserver 1.1.1.1
+search utah.cloudlab.us
+EOF'
+sudo chattr +i /etc/resolv.conf
+
+# Fix node1
+ssh node1 "sudo systemctl stop systemd-resolved && \
+           sudo systemctl disable systemd-resolved && \
+           sudo rm -f /etc/resolv.conf && \
+           sudo bash -c 'cat > /etc/resolv.conf << EOF
+nameserver 8.8.8.8
+nameserver 8.8.4.4
+nameserver 1.1.1.1
+search utah.cloudlab.us
+EOF' && \
+           sudo chattr +i /etc/resolv.conf"
+
+# Fix node2
+ssh node2 "sudo systemctl stop systemd-resolved && \
+           sudo systemctl disable systemd-resolved && \
+           sudo rm -f /etc/resolv.conf && \
+           sudo bash -c 'cat > /etc/resolv.conf << EOF
+nameserver 8.8.8.8
+nameserver 8.8.4.4
+nameserver 1.1.1.1
+search utah.cloudlab.us
+EOF' && \
+           sudo chattr +i /etc/resolv.conf"
+
+# Verify DNS on all nodes
+nslookup github.com
+ssh node1 "nslookup github.com"
+ssh node2 "nslookup github.com"
+```
+
+**Why this is important:**
+- Without working DNS, container image pulls will fail
+- OVN pods won't be able to reach the Kubernetes API server
+- Nodes will remain NotReady
+- This fix is **permanent** and survives reboots
 
 ---
 
@@ -266,7 +357,7 @@ sleep 10
 
 ### Step 8: Approve Certificate Signing Requests (node0)
 
-OVN-Kubernetes pods request certificates for authentication. These must be approved:
+**CRITICAL:** OVN-Kubernetes pods request certificates for authentication. These must be manually approved the first time.
 
 ```bash
 # Check for pending CSRs
@@ -275,11 +366,93 @@ kubectl get csr
 # Approve all pending CSRs
 kubectl get csr -o name | xargs kubectl certificate approve
 
-# Verify all are approved
+# Verify all are approved (should show "Approved,Issued")
 kubectl get csr
 ```
 
 **Expected:** All CSRs should show `CONDITION: Approved,Issued`
+
+---
+
+### Step 8b: Enable Automatic CSR Approval (OPTIONAL but Recommended)
+
+To avoid having to manually approve CSRs every time OVN pods restart, set up automatic approval:
+
+```bash
+cat <<EOF | kubectl apply -f -
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: csr-approver
+  namespace: kube-system
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: csr-approver
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: system:certificates.k8s.io:certificatesigningrequests:nodeclient
+subjects:
+- kind: ServiceAccount
+  name: csr-approver
+  namespace: kube-system
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: csr-approver-approve
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: system:certificates.k8s.io:certificatesigningrequests:selfnodeclient
+subjects:
+- kind: ServiceAccount
+  name: csr-approver
+  namespace: kube-system
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: csr-approver
+  namespace: kube-system
+spec:
+  schedule: "*/1 * * * *"
+  successfulJobsHistoryLimit: 1
+  failedJobsHistoryLimit: 1
+  jobTemplate:
+    spec:
+      template:
+        spec:
+          serviceAccountName: csr-approver
+          restartPolicy: OnFailure
+          containers:
+          - name: approver
+            image: bitnami/kubectl:latest
+            command:
+            - /bin/sh
+            - -c
+            - |
+              kubectl get csr -o json | \
+              jq -r '.items[] | select(.status.conditions == null) | .metadata.name' | \
+              xargs -r kubectl certificate approve
+EOF
+```
+
+**What this does:**
+- Creates a CronJob that runs every minute
+- Automatically approves any pending CSRs
+- Prevents OVN pods from crashing due to certificate expiration
+
+**Verify it's working:**
+```bash
+# Check cronjob exists
+kubectl get cronjob -n kube-system csr-approver
+
+# Check if jobs are running
+kubectl get jobs -n kube-system | grep csr-approver
+```
 
 ---
 
@@ -340,6 +513,187 @@ ovs-node-xxx        1/1     Running   0          6m
 NAME     STATUS   ROLES           AGE   VERSION
 node0    Ready    control-plane   30m   v1.29.15
 node1    Ready    <none>          29m   v1.29.15
+```
+
+---
+
+## Critical CloudLab Setup Summary
+
+For a successful deployment on CloudLab, follow this exact order:
+
+### 1. Fix DNS FIRST (Before Everything)
+```bash
+# On all nodes, permanently fix DNS
+sudo systemctl stop systemd-resolved
+sudo systemctl disable systemd-resolved
+sudo rm -f /etc/resolv.conf
+sudo bash -c 'cat > /etc/resolv.conf << EOF
+nameserver 8.8.8.8
+nameserver 8.8.4.4
+EOF'
+sudo chattr +i /etc/resolv.conf
+```
+
+**Why:** Without working DNS, nothing will work - no image pulls, no git, no package installs.
+
+### 2. Setup Kubernetes Cluster (Part 1)
+```bash
+# All nodes: ./all.sh
+# node0: ./node0.sh
+# Workers: ./worker.sh "<join command>"
+```
+
+### 3. Build and Deploy OVN-Kubernetes (Part 2, Steps 1-7)
+- Patch kubectl commands with `--validate=false`
+- Build and distribute image
+- Generate manifests
+- Deploy OVN components
+
+### 4. Approve CSRs Manually (First Time)
+```bash
+kubectl get csr -o name | xargs kubectl certificate approve
+```
+
+**Why:** OVN pods need certificates to communicate with API server. First approval must be manual.
+
+### 5. Setup Auto-CSR Approval (One-Time)
+Deploy the CSR approver CronJob (Step 8b) so you never have to manually approve again.
+
+### 6. Restart Worker Services
+```bash
+# On each worker
+sudo chmod 644 /etc/cni/net.d/10-ovn-kubernetes.conf
+sudo systemctl restart containerd && sleep 10 && sudo systemctl restart kubelet
+```
+
+**Why:** Kubelet and containerd need to reload CNI configuration.
+
+### 7. Verify Everything
+```bash
+kubectl get nodes  # All Ready
+kubectl get pods -n ovn-kubernetes  # All 3/3 Running
+```
+
+---
+
+## Common Mistakes
+
+### ❌ Deploying without fixing DNS first
+**Result:** Image pulls fail, pods stuck in ImagePullBackOff
+
+### ❌ Forgetting to approve CSRs
+**Result:** ovnkube-node pods crash with "certificate not signed"
+
+### ❌ Not restarting containerd after DNS fix
+**Result:** Containerd cached old DNS, image pulls still fail
+
+### ❌ Patching after building the image
+**Result:** ovnkube-db crashes with API server validation errors
+
+### ❌ Not restarting kubelet on workers
+**Result:** Nodes stay NotReady with "cni plugin not initialized"
+
+---
+
+## Quick Start (Complete Workflow)
+
+For experienced users, here's the complete workflow:
+
+```bash
+# === Part 1: Kubernetes Cluster ===
+
+# On all nodes: Fix DNS FIRST
+sudo systemctl stop systemd-resolved && sudo systemctl disable systemd-resolved
+sudo rm -f /etc/resolv.conf
+sudo bash -c 'cat > /etc/resolv.conf << EOF
+nameserver 8.8.8.8
+nameserver 8.8.4.4
+EOF'
+sudo chattr +i /etc/resolv.conf
+
+# On all nodes: Setup Kubernetes
+cd ~/CSCI599
+./all.sh && newgrp docker
+
+# On node0: Initialize control plane
+./node0.sh
+cat join.sh
+
+# On workers: Join cluster
+./worker.sh "<join command from node0>"
+
+# === Part 2: OVN-Kubernetes CNI ===
+
+# On node0: Install dependencies
+curl -LO https://go.dev/dl/go1.21.7.linux-amd64.tar.gz
+sudo tar -C /usr/local -xzf go1.21.7.linux-amd64.tar.gz
+export PATH=$PATH:/usr/local/go/bin
+pip3 install --user jinjanator
+export PATH="$HOME/.local/bin:$PATH"
+
+# On node0: Clone and patch OVN-Kubernetes
+git clone https://github.com/Anirudh-R-1201/ovn-kubernetes.git
+cd ovn-kubernetes
+sed -i 's/ apply -f/ apply --validate=false -f/g' dist/images/ovnkube.sh
+sed -i 's/ create -f/ create --validate=false -f/g' dist/images/ovnkube.sh
+sed -i 's/ patch / patch --validate=false /g' dist/images/ovnkube.sh
+
+# Build and distribute
+cd dist/images && make ubuntu-image
+docker tag ovn-kube-ubuntu:latest ovn-kube:latest
+docker save ovn-kube:latest -o ~/ovn-kube.tar
+sudo ctr -n k8s.io image import ~/ovn-kube.tar
+
+# From laptop: distribute to workers
+scp node0:~/ovn-kube.tar .
+scp ovn-kube.tar node1:~/
+scp ovn-kube.tar node2:~/
+
+# On workers: import image
+ssh node1 "sudo ctr -n k8s.io image import ~/ovn-kube.tar"
+ssh node2 "sudo ctr -n k8s.io image import ~/ovn-kube.tar"
+
+# On all nodes: prepare directories
+sudo mkdir -p /var/lib/ovn/etc /var/lib/ovn/data
+ssh node1 "sudo mkdir -p /var/lib/ovn/etc /var/lib/ovn/data"
+ssh node2 "sudo mkdir -p /var/lib/ovn/etc /var/lib/ovn/data"
+
+# On node0: generate and deploy
+cd ~/ovn-kubernetes/dist/images
+./daemonset.sh --image=ovn-kube:latest --net-cidr=10.128.0.0/14 --svc-cidr=172.30.0.0/16
+
+cd ~/ovn-kubernetes
+kubectl apply -f dist/yaml/ovn-setup.yaml
+CORRECT_API_SERVER=$(kubectl config view -o jsonpath='{.clusters[0].cluster.server}')
+kubectl patch configmap ovn-config -n ovn-kubernetes --type merge -p "{\"data\":{\"k8s_apiserver\":\"${CORRECT_API_SERVER}\"}}"
+kubectl apply -f dist/yaml/rbac-ovnkube-db.yaml
+kubectl apply -f dist/yaml/rbac-ovnkube-master.yaml
+kubectl apply -f dist/yaml/rbac-ovnkube-node.yaml
+kubectl apply -f dist/yaml/ovs-node.yaml
+sleep 30
+kubectl apply -f dist/yaml/ovnkube-db.yaml
+sleep 60
+kubectl apply -f dist/yaml/ovnkube-master.yaml
+kubectl apply -f dist/yaml/ovnkube-node.yaml
+
+# Approve CSRs (FIRST TIME - MANUAL)
+sleep 10
+kubectl get csr -o name | xargs kubectl certificate approve
+
+# Setup auto-approval (see Step 8b for full YAML)
+kubectl apply -f csr-approver.yaml
+
+# On workers: restart services
+ssh node1 "sudo chmod 644 /etc/cni/net.d/10-ovn-kubernetes.conf && \
+           sudo systemctl restart containerd && sleep 10 && \
+           sudo systemctl restart kubelet"
+ssh node2 "sudo chmod 644 /etc/cni/net.d/10-ovn-kubernetes.conf && \
+           sudo systemctl restart containerd && sleep 10 && \
+           sudo systemctl restart kubelet"
+
+# Verify
+kubectl get nodes
+kubectl get pods -n ovn-kubernetes -o wide
 ```
 
 ---
