@@ -22,6 +22,9 @@ DATA_DIR="${DATA_DIR_BASE}/loadgen"
 mkdir -p "${DATA_DIR}"
 export LOADGEN_DIR="${DATA_DIR}"
 
+# Create metadata file for graph compatibility
+META_FILE="${DATA_DIR}/bursts.jsonl"
+
 echo "=========================================="
 echo "Concurrent Multi-Service Load Test"
 echo "=========================================="
@@ -41,6 +44,13 @@ PRODUCT_ID=$(kubectl --kubeconfig "${KUBECONFIG_PATH}" exec fortio-loadgen -- \
 echo "Using product ID: ${PRODUCT_ID}"
 echo ""
 
+# Write burst metadata for graph compatibility
+cat > "${META_FILE}" <<EOF
+{"burst_index": 0, "endpoint": "home", "qps": ${QPS_HOME}, "duration_s": ${DURATION}, "sleep_s": 0}
+{"burst_index": 1, "endpoint": "product", "qps": ${QPS_PRODUCT}, "duration_s": ${DURATION}, "sleep_s": 0}
+{"burst_index": 2, "endpoint": "cart", "qps": ${QPS_CART}, "duration_s": ${DURATION}, "sleep_s": 0}
+EOF
+
 # Define concurrent load generators
 echo "Starting concurrent load generators..."
 echo ""
@@ -54,8 +64,8 @@ echo "  Services exercised: productcatalog, recommendation, ad, cart"
 kubectl --kubeconfig "${KUBECONFIG_PATH}" exec fortio-loadgen -- \
   fortio load -c "${THREADS_PER_ENDPOINT}" -qps "${QPS_HOME}" -t "${DURATION}s" \
   -p "50,95,99,99.9" -abort-on -1 -allow-initial-errors \
-  -json - -labels "concurrent-home-${RUN_ID}" \
-  http://frontend:80/ > "${DATA_DIR}/concurrent-home.json" 2> "${DATA_DIR}/concurrent-home.log" &
+  -json - -labels "stage1-burst-0-home" \
+  http://frontend:80/ > "${DATA_DIR}/fortio-burst-0.json" 2> "${DATA_DIR}/fortio-burst-0.log" &
 PIDS+=($!)
 
 sleep 2
@@ -66,8 +76,8 @@ echo "  Services exercised: productcatalog, recommendation, currency"
 kubectl --kubeconfig "${KUBECONFIG_PATH}" exec fortio-loadgen -- \
   fortio load -c "${THREADS_PER_ENDPOINT}" -qps "${QPS_PRODUCT}" -t "${DURATION}s" \
   -p "50,95,99,99.9" -abort-on -1 -allow-initial-errors \
-  -json - -labels "concurrent-product-${RUN_ID}" \
-  "http://frontend:80/product/${PRODUCT_ID}" > "${DATA_DIR}/concurrent-product.json" 2> "${DATA_DIR}/concurrent-product.log" &
+  -json - -labels "stage1-burst-1-product" \
+  "http://frontend:80/product/${PRODUCT_ID}" > "${DATA_DIR}/fortio-burst-1.json" 2> "${DATA_DIR}/fortio-burst-1.log" &
 PIDS+=($!)
 
 sleep 2
@@ -78,8 +88,8 @@ echo "  Services exercised: cart, currency"
 kubectl --kubeconfig "${KUBECONFIG_PATH}" exec fortio-loadgen -- \
   fortio load -c "${THREADS_PER_ENDPOINT}" -qps "${QPS_CART}" -t "${DURATION}s" \
   -p "50,95,99,99.9" -abort-on -1 -allow-initial-errors \
-  -json - -labels "concurrent-cart-${RUN_ID}" \
-  http://frontend:80/cart > "${DATA_DIR}/concurrent-cart.json" 2> "${DATA_DIR}/concurrent-cart.log" &
+  -json - -labels "stage1-burst-2-cart" \
+  http://frontend:80/cart > "${DATA_DIR}/fortio-burst-2.json" 2> "${DATA_DIR}/fortio-burst-2.log" &
 PIDS+=($!)
 
 echo ""
@@ -109,11 +119,12 @@ echo ""
 echo "Results stored in: ${DATA_DIR}"
 echo ""
 echo "Quick summary:"
-for endpoint in home product cart; do
-  if [ -f "${DATA_DIR}/concurrent-${endpoint}.json" ]; then
+for idx in 0 1 2; do
+  endpoint_name=("HOME" "PRODUCT" "CART")
+  if [ -f "${DATA_DIR}/fortio-burst-${idx}.json" ]; then
     echo ""
-    echo "► ${endpoint^^} endpoint:"
-    cat "${DATA_DIR}/concurrent-${endpoint}.json" | python3 -c "
+    echo "► ${endpoint_name[$idx]} endpoint (burst ${idx}):"
+    cat "${DATA_DIR}/fortio-burst-${idx}.json" | python3 -c "
 import json, sys
 data = json.load(sys.stdin)
 print(f\"  Requests: {data.get('DurationHistogram', {}).get('Count', 'N/A')}\")
@@ -129,4 +140,8 @@ done
 echo ""
 echo "Check HPA status:"
 echo "  kubectl get hpa"
+echo ""
+echo "Generate graphs:"
+echo "  cd ~/CSCI599/stage1-baseline"
+echo "  ./06-generate-graphs.sh data/${RUN_ID}"
 echo ""
