@@ -34,9 +34,9 @@ echo ""
 echo "Creating new HPAs..."
 
 # Frontend handles most load, so give it more replicas
-echo "  frontend: min=${MIN_REPLICAS}, max=$((MAX_REPLICAS + 2)), cpu=${75}%"
+echo "  frontend: min=${MIN_REPLICAS}, max=$((MAX_REPLICAS + 2)), cpu=${CPU_THRESHOLD+75}%"
 kubectl --kubeconfig "${KUBECONFIG_PATH}" autoscale deployment frontend \
-  --cpu-percent="${75}" \
+  --cpu-percent="${CPU_THRESHOLD+75}" \
   --min="${MIN_REPLICAS}" \
   --max="$((MAX_REPLICAS + 2))"
 
