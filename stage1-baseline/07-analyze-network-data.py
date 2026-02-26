@@ -93,7 +93,6 @@ def load_service_endpoint_nodes(network_dir: Path) -> Dict[str, Set[str]]:
 
 def summarize_pod_placement(pod_snapshots: List[dict]) -> dict:
     pod_history = defaultdict(list)
-    service_node_counter = defaultdict(Counter)
     ts_node_to_pods = {}
 
     for snap in pod_snapshots:
@@ -110,7 +109,6 @@ def summarize_pod_placement(pod_snapshots: List[dict]) -> dict:
 
             pod_history[pod_name].append({"timestamp": ts, "node": node, "app": app})
             node_to_pods[node].append(pod_name)
-            service_node_counter[app][node] += 1
         ts_node_to_pods[ts] = node_to_pods
 
     pod_movements = {}
@@ -123,13 +121,22 @@ def summarize_pod_placement(pod_snapshots: List[dict]) -> dict:
     latest_ts = sorted(ts_node_to_pods.keys())[-1] if ts_node_to_pods else None
     latest = ts_node_to_pods.get(latest_ts, {})
 
+    # Service -> node -> pod count from **latest snapshot only** (actual current placement)
+    latest_snap = next((s for s in pod_snapshots if s["timestamp"] == latest_ts), None)
     service_node_spread = {}
-    for svc, counter in service_node_counter.items():
-        service_node_spread[svc] = {
-            "nodes_used": sorted(counter.keys()),
-            "node_count": len(counter),
-            "samples_per_node": dict(counter),
-        }
+    if latest_snap:
+        service_node_counter_latest: Dict[str, Counter] = defaultdict(Counter)
+        for pod in latest_snap["items"]:
+            app = (pod.get("metadata") or {}).get("labels", {}).get("app", "unknown")
+            node = (pod.get("spec") or {}).get("nodeName", "unknown")
+            if node and node != "unknown":
+                service_node_counter_latest[app][node] += 1
+        for svc, counter in service_node_counter_latest.items():
+            service_node_spread[svc] = {
+                "nodes_used": sorted(counter.keys()),
+                "node_count": len(counter),
+                "pod_count_by_node": dict(counter),
+            }
 
     return {
         "latest_timestamp": latest_ts,
@@ -460,8 +467,9 @@ def write_text_report(
         for svc in sorted(spread.keys()):
             info = spread[svc]
             nodes_used = info.get("nodes_used", [])
-            samples = info.get("samples_per_node", {})
-            parts = [f"{n} ({samples.get(n, 0)} pod(s))" for n in nodes_used]
+            # Prefer pod_count_by_node (latest snapshot); fall back to samples_per_node (legacy)
+            counts = info.get("pod_count_by_node") or info.get("samples_per_node", {})
+            parts = [f"{n} ({counts.get(n, 0)} pod(s))" for n in nodes_used]
             lines.append(f"  {svc}: {', '.join(parts)}")
     else:
         lines.append("  No service-node spread data.")

@@ -64,7 +64,7 @@ Primary outputs:
 - `network-analysis/node-pair-latency-summary.json` (p95/p99 by source_node → target_service)
 - `network-analysis/latency-vs-replicas.csv` (HPA desired/current vs s2s p95/p99 per timestamp)
 - `network-analysis/experiment-metrics-recommendations.md`
-- `graphs/*.png` (if matplotlib available): latency percentiles, QPS, pod distribution, **service_placement_by_node.png**
+- `graphs/*.png` (if matplotlib available): 01–06 in story order (load → response → latency vs QPS → scaling → **service placement** → summary); see `graphs/README.txt`
 
 ## Data Layout
 

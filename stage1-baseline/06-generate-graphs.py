@@ -156,10 +156,11 @@ def plot_service_placement(placement, output_dir):
         return n.split(".")[0] if n else n
 
     node_labels = [short_node(n) for n in nodes]
-    # Build matrix: rows = services, cols = nodes
+    # Build matrix: rows = services, cols = nodes (use pod_count_by_node = latest snapshot only; fallback: samples_per_node for legacy)
     data = []
     for svc in services:
-        row = [spread[svc].get("samples_per_node", {}).get(n, 0) for n in nodes]
+        counts = spread[svc].get("pod_count_by_node") or spread[svc].get("samples_per_node", {})
+        row = [counts.get(n, 0) for n in nodes]
         data.append(row)
 
     if not data or not nodes:
@@ -176,7 +177,7 @@ def plot_service_placement(placement, output_dir):
 
     ax.set_xlabel("Node", fontsize=12)
     ax.set_ylabel("Service", fontsize=12)
-    ax.set_title("Pod placement: which service's pods are on which node (latest snapshot)", fontsize=12, fontweight="bold")
+    ax.set_title("5. Placement: which service's pods are on which node (latest snapshot)", fontsize=12, fontweight="bold")
 
     for i in range(len(services)):
         for j in range(len(nodes)):
@@ -186,9 +187,9 @@ def plot_service_placement(placement, output_dir):
                 ax.text(j, i, str(int(v)), ha="center", va="center",
                         color="white" if v >= max_val / 2 else "black", fontsize=10)
 
-    plt.colorbar(im, ax=ax, label="Pod count")
+    plt.colorbar(im, ax=ax, label="Pod count (latest snapshot)")
     plt.tight_layout()
-    output_path = os.path.join(output_dir, "service_placement_by_node.png")
+    output_path = os.path.join(output_dir, "05_service_placement_by_node.png")
     plt.savefig(output_path, dpi=300, bbox_inches="tight")
     print(f"✓ Generated: {output_path}")
     plt.close()
@@ -209,14 +210,14 @@ def plot_latency_percentiles(bursts, output_dir):
     ax.plot(indices, p99, '^-', label='p99', linewidth=2, markersize=4)
     ax.plot(indices, p999, 'v-', label='p99.9', linewidth=2, markersize=4)
     
-    ax.set_xlabel('Burst Index', fontsize=12)
+    ax.set_xlabel('Burst index', fontsize=12)
     ax.set_ylabel('Latency (ms)', fontsize=12)
-    ax.set_title('Response Latency Percentiles Across Traffic Bursts', fontsize=14, fontweight='bold')
+    ax.set_title('2. Response: latency percentiles over traffic bursts', fontsize=14, fontweight='bold')
     ax.legend(loc='best', fontsize=10)
     ax.grid(True, alpha=0.3)
     
     plt.tight_layout()
-    output_path = os.path.join(output_dir, "latency_percentiles.png")
+    output_path = os.path.join(output_dir, "02_latency_percentiles.png")
     plt.savefig(output_path, dpi=300, bbox_inches='tight')
     print(f"✓ Generated: {output_path}")
     plt.close()
@@ -236,16 +237,16 @@ def plot_qps_comparison(bursts, output_dir):
     ax.bar(x - width/2, requested, width, label='Requested QPS', alpha=0.8)
     ax.bar(x + width/2, actual, width, label='Actual QPS', alpha=0.8)
     
-    ax.set_xlabel('Burst Index', fontsize=12)
-    ax.set_ylabel('Queries Per Second (QPS)', fontsize=12)
-    ax.set_title('Requested vs Actual QPS per Burst', fontsize=14, fontweight='bold')
+    ax.set_xlabel('Burst index', fontsize=12)
+    ax.set_ylabel('Queries per second (QPS)', fontsize=12)
+    ax.set_title('1. Load: requested vs actual QPS per burst', fontsize=14, fontweight='bold')
     ax.set_xticks(x[::2])  # Show every 2nd label to avoid crowding
     ax.set_xticklabels([str(i) for i in indices[::2]])
     ax.legend(loc='best', fontsize=10)
     ax.grid(True, alpha=0.3, axis='y')
     
     plt.tight_layout()
-    output_path = os.path.join(output_dir, "qps_comparison.png")
+    output_path = os.path.join(output_dir, "01_qps_comparison.png")
     plt.savefig(output_path, dpi=300, bbox_inches='tight')
     print(f"✓ Generated: {output_path}")
     plt.close()
@@ -266,12 +267,12 @@ def plot_latency_vs_qps(bursts, output_dir):
     
     ax.set_xlabel('Actual QPS', fontsize=12)
     ax.set_ylabel('Latency (ms)', fontsize=12)
-    ax.set_title('Latency vs QPS Correlation', fontsize=14, fontweight='bold')
+    ax.set_title('3. Latency vs load: does higher QPS increase latency?', fontsize=14, fontweight='bold')
     ax.legend(loc='best', fontsize=10)
     ax.grid(True, alpha=0.3)
     
     plt.tight_layout()
-    output_path = os.path.join(output_dir, "latency_vs_qps.png")
+    output_path = os.path.join(output_dir, "03_latency_vs_qps.png")
     plt.savefig(output_path, dpi=300, bbox_inches='tight')
     print(f"✓ Generated: {output_path}")
     plt.close()
@@ -304,14 +305,14 @@ def plot_pod_distribution(snapshots, output_dir):
     ax.stackplot(indices, *[node_data[node] for node in all_nodes], 
                  labels=all_nodes, alpha=0.8, colors=colors)
     
-    ax.set_xlabel('Snapshot Index', fontsize=12)
-    ax.set_ylabel('Number of Pods', fontsize=12)
-    ax.set_title('Pod Distribution Across Nodes Over Time', fontsize=14, fontweight='bold')
+    ax.set_xlabel('Snapshot index', fontsize=12)
+    ax.set_ylabel('Number of pods', fontsize=12)
+    ax.set_title('4. Scaling: pod count per node over time', fontsize=14, fontweight='bold')
     ax.legend(loc='upper left', fontsize=10, bbox_to_anchor=(1, 1))
     ax.grid(True, alpha=0.3, axis='y')
     
     plt.tight_layout()
-    output_path = os.path.join(output_dir, "pod_distribution.png")
+    output_path = os.path.join(output_dir, "04_pod_distribution.png")
     plt.savefig(output_path, dpi=300, bbox_inches='tight')
     print(f"✓ Generated: {output_path}")
     plt.close()
@@ -338,11 +339,11 @@ def plot_latency_distribution(bursts, output_dir):
         patch.set_facecolor(color)
     
     ax.set_ylabel('Latency (ms)', fontsize=12)
-    ax.set_title('Latency Distribution Across All Bursts', fontsize=14, fontweight='bold')
+    ax.set_title('6. Summary: latency distribution across all bursts', fontsize=14, fontweight='bold')
     ax.grid(True, alpha=0.3, axis='y')
     
     plt.tight_layout()
-    output_path = os.path.join(output_dir, "latency_distribution.png")
+    output_path = os.path.join(output_dir, "06_latency_distribution.png")
     plt.savefig(output_path, dpi=300, bbox_inches='tight')
     print(f"✓ Generated: {output_path}")
     plt.close()
@@ -467,33 +468,34 @@ def main():
     else:
         print("  No pod placement data found")
     
-    # Generate graphs
-    print("\nGenerating graphs...")
-    plot_latency_percentiles(bursts, output_dir)
+    # Generate graphs in story order (view 01–06 in order to understand the experiment)
+    print("\nGenerating graphs (story order: load → response → scaling → placement → summary)...")
     plot_qps_comparison(bursts, output_dir)
+    plot_latency_percentiles(bursts, output_dir)
     plot_latency_vs_qps(bursts, output_dir)
-    plot_latency_distribution(bursts, output_dir)
-    
     if snapshots:
         plot_pod_distribution(snapshots, output_dir)
-
     placement = load_service_placement(data_dir)
     if placement:
         plot_service_placement(placement, output_dir)
-
+    plot_latency_distribution(bursts, output_dir)
     generate_summary_stats(bursts, snapshots, output_dir)
 
+    # Write a short README so viewers know the order
+    readme_path = os.path.join(output_dir, "README.txt")
+    with open(readme_path, "w") as f:
+        f.write("Experiment graphs – view in order to follow the story:\n\n")
+        f.write("  01_qps_comparison.png       – Load applied (requested vs actual QPS per burst)\n")
+        f.write("  02_latency_percentiles.png  – Response latency over time (p50/p95/p99)\n")
+        f.write("  03_latency_vs_qps.png      – Latency vs load: does higher QPS increase latency?\n")
+        f.write("  04_pod_distribution.png    – Scaling: pod count per node over time\n")
+        f.write("  05_service_placement_by_node.png – Placement: which service's pods are on which node\n")
+        f.write("  06_latency_distribution.png – Summary: latency distribution across bursts\n\n")
+        f.write("  summary_stats.txt          – Numeric summary\n")
+    print(f"✓ Generated: {readme_path}")
+
     print(f"\n✓ All graphs generated in: {output_dir}")
-    print("\nGenerated files:")
-    print("  - latency_percentiles.png   : p50/p95/p99/p99.9 over time")
-    print("  - qps_comparison.png        : Requested vs actual QPS")
-    print("  - latency_vs_qps.png        : Latency correlation with QPS")
-    print("  - latency_distribution.png  : Box plot of latency distribution")
-    if snapshots:
-        print("  - pod_distribution.png      : Pod placement across nodes over time")
-    if placement:
-        print("  - service_placement_by_node.png : Which service's pods are on which node")
-    print("  - summary_stats.txt         : Summary statistics")
+    print("\nView in order (01 → 06) to follow the experiment story. See graphs/README.txt.")
 
 
 if __name__ == "__main__":
