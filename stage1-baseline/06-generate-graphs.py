@@ -126,7 +126,72 @@ def load_pod_placement_data(data_dir):
     return None
 
 
-def plot_latency_percentiles(bursts, output_dir):
+def load_service_placement(data_dir):
+    """Load service -> nodes placement from network-analysis/pod-placement-analysis.json."""
+    path = os.path.join(data_dir, "network-analysis", "pod-placement-analysis.json")
+    if not os.path.exists(path):
+        return None
+    try:
+        with open(path, "r") as f:
+            return json.load(f)
+    except Exception:
+        return None
+
+
+def plot_service_placement(placement, output_dir):
+    """Plot which service's pods are on which node (heatmap: service x node, value = pod count)."""
+    spread = placement.get("service_node_spread") if placement else None
+    if not spread:
+        print("⚠ No service_node_spread in placement, skipping service placement graph")
+        return
+
+    services = sorted(spread.keys())
+    all_nodes = set()
+    for info in spread.values():
+        all_nodes.update(info.get("nodes_used", []))
+    nodes = sorted(all_nodes)
+
+    # Short labels for axes (strip long hostnames to last part)
+    def short_node(n):
+        return n.split(".")[0] if n else n
+
+    node_labels = [short_node(n) for n in nodes]
+    # Build matrix: rows = services, cols = nodes
+    data = []
+    for svc in services:
+        row = [spread[svc].get("samples_per_node", {}).get(n, 0) for n in nodes]
+        data.append(row)
+
+    if not data or not nodes:
+        print("⚠ No service/node data for placement heatmap")
+        return
+
+    fig, ax = plt.subplots(figsize=(max(8, len(nodes) * 1.5), max(6, len(services) * 0.4)))
+    im = ax.imshow(data, cmap="Blues", aspect="auto", vmin=0, vmax=max(max(r) for r in data) or 1)
+
+    ax.set_xticks(range(len(nodes)))
+    ax.set_xticklabels(node_labels, rotation=45, ha="right")
+    ax.set_yticks(range(len(services)))
+    ax.set_yticklabels(services)
+
+    ax.set_xlabel("Node", fontsize=12)
+    ax.set_ylabel("Service", fontsize=12)
+    ax.set_title("Pod placement: which service's pods are on which node (latest snapshot)", fontsize=12, fontweight="bold")
+
+    for i in range(len(services)):
+        for j in range(len(nodes)):
+            v = data[i][j]
+            if v > 0:
+                max_val = max(max(r) for r in data) or 1
+                ax.text(j, i, str(int(v)), ha="center", va="center",
+                        color="white" if v >= max_val / 2 else "black", fontsize=10)
+
+    plt.colorbar(im, ax=ax, label="Pod count")
+    plt.tight_layout()
+    output_path = os.path.join(output_dir, "service_placement_by_node.png")
+    plt.savefig(output_path, dpi=300, bbox_inches="tight")
+    print(f"✓ Generated: {output_path}")
+    plt.close()
     """Plot latency percentiles (p50, p95, p99, p99.9) over bursts."""
     fig, ax = plt.subplots(figsize=(14, 6))
     
@@ -408,9 +473,13 @@ def main():
     
     if snapshots:
         plot_pod_distribution(snapshots, output_dir)
-    
+
+    placement = load_service_placement(data_dir)
+    if placement:
+        plot_service_placement(placement, output_dir)
+
     generate_summary_stats(bursts, snapshots, output_dir)
-    
+
     print(f"\n✓ All graphs generated in: {output_dir}")
     print("\nGenerated files:")
     print("  - latency_percentiles.png   : p50/p95/p99/p99.9 over time")
@@ -419,6 +488,8 @@ def main():
     print("  - latency_distribution.png  : Box plot of latency distribution")
     if snapshots:
         print("  - pod_distribution.png      : Pod placement across nodes over time")
+    if placement:
+        print("  - service_placement_by_node.png : Which service's pods are on which node")
     print("  - summary_stats.txt         : Summary statistics")
 
 

@@ -57,14 +57,14 @@ MODE=full CPU_THRESHOLD=75 BURSTS=24 QPS_FLOOR=220 QPS_CEIL=1700 ./01-run-experi
 
 Primary outputs:
 
-- `network-analysis/analysis-summary.txt` (includes queueing vs network and node-pair sections)
+- `network-analysis/analysis-summary.txt` (sections: Node→Pods, **Service→Nodes** (which service's pods are on which node), e2e latency, s2s, queueing vs network, node-pair tail latency)
 - `network-analysis/pod-placement-analysis.json`
 - `network-analysis/e2e-latency-summary.json`
 - `network-analysis/service-to-service-latency-summary.json`
 - `network-analysis/node-pair-latency-summary.json` (p95/p99 by source_node → target_service)
 - `network-analysis/latency-vs-replicas.csv` (HPA desired/current vs s2s p95/p99 per timestamp)
 - `network-analysis/experiment-metrics-recommendations.md`
-- `graphs/*.png` (if matplotlib available)
+- `graphs/*.png` (if matplotlib available): latency percentiles, QPS, pod distribution, **service_placement_by_node.png**
 
 ## Data Layout
 

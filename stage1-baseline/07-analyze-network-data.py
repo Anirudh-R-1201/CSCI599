@@ -453,6 +453,19 @@ def write_text_report(
             for pod in pods:
                 lines.append(f"  - {pod}")
     lines.append("")
+    lines.append("1b) Service -> Nodes (which service's pods are on which node)")
+    lines.append("-" * 80)
+    spread = placement.get("service_node_spread", {})
+    if spread:
+        for svc in sorted(spread.keys()):
+            info = spread[svc]
+            nodes_used = info.get("nodes_used", [])
+            samples = info.get("samples_per_node", {})
+            parts = [f"{n} ({samples.get(n, 0)} pod(s))" for n in nodes_used]
+            lines.append(f"  {svc}: {', '.join(parts)}")
+    else:
+        lines.append("  No service-node spread data.")
+    lines.append("")
     lines.append(f"Pods that moved nodes: {len(placement.get('pod_movements', {}))}")
     lines.append("")
     lines.append("2) End-to-end Latency (frontend endpoints)")
