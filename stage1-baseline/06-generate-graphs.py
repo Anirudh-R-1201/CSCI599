@@ -192,6 +192,9 @@ def plot_service_placement(placement, output_dir):
     plt.savefig(output_path, dpi=300, bbox_inches="tight")
     print(f"✓ Generated: {output_path}")
     plt.close()
+
+
+def plot_latency_percentiles(bursts, output_dir):
     """Plot latency percentiles (p50, p95, p99, p99.9) over bursts."""
     fig, ax = plt.subplots(figsize=(14, 6))
     
