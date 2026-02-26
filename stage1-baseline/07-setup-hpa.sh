@@ -5,9 +5,10 @@ set -euo pipefail
 # This script configures HPA with customizable CPU thresholds and replica counts
 
 KUBECONFIG_PATH="${KUBECONFIG_PATH:-$HOME/.kube/config}"
-CPU_THRESHOLD="${CPU_THRESHOLD:-25}"  # CPU percentage to trigger scaling
+CPU_THRESHOLD="${CPU_THRESHOLD:-75}"  # CPU percentage to trigger scaling
 MIN_REPLICAS="${MIN_REPLICAS:-1}"     # Minimum replicas per service
 MAX_REPLICAS="${MAX_REPLICAS:-8}"     # Maximum replicas per service
+FRONTEND_EXTRA_CPU="${FRONTEND_EXTRA_CPU:-5}" # Slightly higher target for frontend
 
 echo "Setting up HorizontalPodAutoscalers..."
 echo "  CPU Threshold: ${CPU_THRESHOLD}%"
@@ -34,9 +35,10 @@ echo ""
 echo "Creating new HPAs..."
 
 # Frontend handles most load, so give it more replicas
-echo "  frontend: min=${MIN_REPLICAS}, max=$((MAX_REPLICAS + 2)), cpu=${CPU_THRESHOLD+75}%"
+FRONTEND_CPU_TARGET=$((CPU_THRESHOLD + FRONTEND_EXTRA_CPU))
+echo "  frontend: min=${MIN_REPLICAS}, max=$((MAX_REPLICAS + 2)), cpu=${FRONTEND_CPU_TARGET}%"
 kubectl --kubeconfig "${KUBECONFIG_PATH}" autoscale deployment frontend \
-  --cpu-percent="${CPU_THRESHOLD+75}" \
+  --cpu-percent="${FRONTEND_CPU_TARGET}" \
   --min="${MIN_REPLICAS}" \
   --max="$((MAX_REPLICAS + 2))"
 

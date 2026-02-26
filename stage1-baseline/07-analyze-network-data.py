@@ -1,390 +1,648 @@
 #!/usr/bin/env python3
 """
-Analyze detailed network data collected during load tests.
-Generates reports on pod-to-pod latencies, pod placement, and network performance.
+Analyze bursty load + network telemetry outputs.
+
+Generates:
+1) pod to node placement mappings and movement
+2) e2e latency stats from fortio runs
+3) service-to-service latency stats from curl probes
+4) extra suggested metrics for network-aware pod placement experiments
 """
 
 import argparse
-import glob
 import json
-import os
-import re
+import math
+import statistics
 import sys
-from collections import defaultdict
+from collections import Counter, defaultdict
 from pathlib import Path
-
-try:
-    import matplotlib
-    matplotlib.use('Agg')
-    import matplotlib.pyplot as plt
-    import numpy as np
-    HAS_MATPLOTLIB = True
-except ImportError:
-    HAS_MATPLOTLIB = False
-    print("Warning: matplotlib not found. Graphs will be skipped.")
+from typing import Dict, List, Optional, Set, Tuple
 
 
-def load_network_data(data_dir):
-    """Load all network analysis data."""
-    network_dir = os.path.join(data_dir, "network-analysis")
-    if not os.path.exists(network_dir):
-        print(f"Error: Network analysis directory not found: {network_dir}")
+def percentile(values: List[float], q: float) -> Optional[float]:
+    if not values:
         return None
-    
-    data = {
-        'pod_network': [],
-        'service_endpoints': [],
-        'pod_latencies': [],
-        'node_network': [],
-        'service_metrics': []
+    if len(values) == 1:
+        return values[0]
+    pos = (len(values) - 1) * (q / 100.0)
+    low = int(math.floor(pos))
+    high = int(math.ceil(pos))
+    if low == high:
+        return values[low]
+    weight = pos - low
+    return values[low] * (1 - weight) + values[high] * weight
+
+
+def safe_mean(values: List[float]) -> Optional[float]:
+    if not values:
+        return None
+    return statistics.fmean(values)
+
+
+def format_ms(v: Optional[float]) -> str:
+    if v is None:
+        return "n/a"
+    return f"{v:.2f} ms"
+
+
+def load_json(path: Path) -> Optional[dict]:
+    try:
+        return json.loads(path.read_text())
+    except Exception:
+        return None
+
+
+def detect_timestamp_from_name(path: Path, prefix: str) -> str:
+    stem = path.stem
+    if stem.startswith(prefix):
+        return stem[len(prefix):]
+    return "unknown"
+
+
+def load_pod_snapshots(network_dir: Path) -> List[dict]:
+    snapshots = []
+    for p in sorted(network_dir.glob("pod-network-*.json")):
+        payload = load_json(p)
+        if not payload:
+            continue
+        timestamp = detect_timestamp_from_name(p, "pod-network-")
+        snapshots.append(
+            {
+                "timestamp": timestamp,
+                "items": payload.get("items", []),
+            }
+        )
+    return snapshots
+
+
+def load_service_endpoint_nodes(network_dir: Path) -> Dict[str, Set[str]]:
+    service_to_nodes: Dict[str, Set[str]] = defaultdict(set)
+    for p in sorted(network_dir.glob("service-endpoints-*.json")):
+        payload = load_json(p)
+        if not payload:
+            continue
+        for item in payload.get("items", []):
+            service_name = (item.get("metadata") or {}).get("name", "unknown")
+            for subset in item.get("subsets", []) or []:
+                for addr in subset.get("addresses", []) or []:
+                    node_name = addr.get("nodeName")
+                    if node_name:
+                        service_to_nodes[service_name].add(node_name)
+    return service_to_nodes
+
+
+def summarize_pod_placement(pod_snapshots: List[dict]) -> dict:
+    pod_history = defaultdict(list)
+    service_node_counter = defaultdict(Counter)
+    ts_node_to_pods = {}
+
+    for snap in pod_snapshots:
+        ts = snap["timestamp"]
+        node_to_pods = defaultdict(list)
+        for pod in snap["items"]:
+            md = pod.get("metadata", {})
+            spec = pod.get("spec", {})
+            labels = md.get("labels", {})
+
+            pod_name = md.get("name", "unknown")
+            app = labels.get("app", "unknown")
+            node = spec.get("nodeName", "unknown")
+
+            pod_history[pod_name].append({"timestamp": ts, "node": node, "app": app})
+            node_to_pods[node].append(pod_name)
+            service_node_counter[app][node] += 1
+        ts_node_to_pods[ts] = node_to_pods
+
+    pod_movements = {}
+    for pod_name, entries in pod_history.items():
+        nodes = [e["node"] for e in entries]
+        unique = sorted(set(nodes))
+        if len(unique) > 1:
+            pod_movements[pod_name] = entries
+
+    latest_ts = sorted(ts_node_to_pods.keys())[-1] if ts_node_to_pods else None
+    latest = ts_node_to_pods.get(latest_ts, {})
+
+    service_node_spread = {}
+    for svc, counter in service_node_counter.items():
+        service_node_spread[svc] = {
+            "nodes_used": sorted(counter.keys()),
+            "node_count": len(counter),
+            "samples_per_node": dict(counter),
+        }
+
+    return {
+        "latest_timestamp": latest_ts,
+        "latest_node_to_pods": {k: sorted(v) for k, v in latest.items()},
+        "pod_movements": pod_movements,
+        "service_node_spread": service_node_spread,
+        "snapshot_count": len(pod_snapshots),
     }
-    
-    # Load pod network snapshots
-    for file_path in sorted(glob.glob(os.path.join(network_dir, "pod-network-*.json"))):
+
+
+def parse_fortio_percentiles(payload: dict) -> Dict[float, float]:
+    hist = payload.get("DurationHistogram", {})
+    rows = hist.get("Percentiles", []) or []
+    out = {}
+    for row in rows:
         try:
-            with open(file_path, 'r') as f:
-                data['pod_network'].append(json.load(f))
-        except Exception as e:
-            print(f"Warning: Could not load {file_path}: {e}")
-    
-    # Load service endpoints
-    for file_path in sorted(glob.glob(os.path.join(network_dir, "service-endpoints-*.json"))):
+            out[float(row.get("Percentile"))] = float(row.get("Value")) * 1000.0
+        except Exception:
+            continue
+    return out
+
+
+def parse_endpoint_from_filename(name: str) -> str:
+    # fortio-burst-<idx>-<endpoint>.json
+    parts = name.replace(".json", "").split("-")
+    if len(parts) >= 4:
+        return parts[-1]
+    return "unknown"
+
+
+def load_e2e_latency(load_dir: Path) -> dict:
+    per_endpoint_records = defaultdict(list)
+    per_burst_total_qps = {}
+
+    for p in sorted(load_dir.glob("fortio-burst-*-*.json")):
+        payload = load_json(p)
+        if not payload:
+            continue
+        endpoint = parse_endpoint_from_filename(p.name)
+        percentiles = parse_fortio_percentiles(payload)
+        rec = {
+            "file": p.name,
+            "actual_qps": float(payload.get("ActualQPS", 0.0)),
+            "count": int((payload.get("DurationHistogram") or {}).get("Count", 0)),
+            "avg_ms": float(payload.get("DurationHistogram", {}).get("Avg", 0.0)) * 1000.0,
+            "p50_ms": percentiles.get(50.0),
+            "p90_ms": percentiles.get(90.0),
+            "p95_ms": percentiles.get(95.0),
+            "p99_ms": percentiles.get(99.0),
+            "p999_ms": percentiles.get(99.9),
+        }
+        per_endpoint_records[endpoint].append(rec)
+
+        # burst id is token at index 2: fortio-burst-<idx>-...
+        tokens = p.name.replace(".json", "").split("-")
+        if len(tokens) >= 4 and tokens[2].isdigit():
+            idx = int(tokens[2])
+            per_burst_total_qps[idx] = per_burst_total_qps.get(idx, 0.0) + rec["actual_qps"]
+
+    endpoint_summary = {}
+    for endpoint, rows in per_endpoint_records.items():
+        p95s = sorted([r["p95_ms"] for r in rows if r["p95_ms"] is not None])
+        p99s = sorted([r["p99_ms"] for r in rows if r["p99_ms"] is not None])
+        qs = [r["actual_qps"] for r in rows]
+        endpoint_summary[endpoint] = {
+            "runs": len(rows),
+            "avg_actual_qps": safe_mean(qs),
+            "max_actual_qps": max(qs) if qs else None,
+            "p95_ms_median": percentile(p95s, 50) if p95s else None,
+            "p95_ms_max": max(p95s) if p95s else None,
+            "p99_ms_median": percentile(p99s, 50) if p99s else None,
+            "p99_ms_max": max(p99s) if p99s else None,
+        }
+
+    burst_qps = sorted(per_burst_total_qps.values())
+    cluster_summary = {
+        "burst_count": len(per_burst_total_qps),
+        "combined_actual_qps_avg": safe_mean(burst_qps),
+        "combined_actual_qps_p95": percentile(sorted(burst_qps), 95) if burst_qps else None,
+        "combined_actual_qps_max": max(burst_qps) if burst_qps else None,
+    }
+
+    return {
+        "endpoint_summary": endpoint_summary,
+        "cluster_summary": cluster_summary,
+    }
+
+
+def parse_probe_kv(raw: str) -> dict:
+    out = {}
+    for token in raw.split():
+        if "=" not in token:
+            continue
+        k, v = token.split("=", 1)
+        if k == "code":
+            try:
+                out[k] = int(v)
+            except Exception:
+                continue
+        else:
+            try:
+                out[k] = float(v) * 1000.0
+            except Exception:
+                continue
+    return out
+
+
+def load_service_to_service(network_dir: Path, service_to_nodes: Dict[str, Set[str]]) -> dict:
+    p = network_dir / "service-to-service-latency.jsonl"
+    if not p.exists():
+        return {"path_summary": {}, "global_summary": {}, "node_pair_summary": {}}
+
+    path_stats = defaultdict(lambda: defaultdict(list))
+    node_pair_totals: Dict[tuple, List[float]] = defaultdict(list)
+    same_node_total = 0
+    all_total = 0
+
+    for raw in p.read_text().splitlines():
+        raw = raw.strip()
+        if not raw:
+            continue
         try:
-            with open(file_path, 'r') as f:
-                data['service_endpoints'].append(json.load(f))
-        except Exception as e:
-            print(f"Warning: Could not load {file_path}: {e}")
-    
-    # Load pod-to-pod latencies
-    for file_path in sorted(glob.glob(os.path.join(network_dir, "pod-latency-*.txt"))):
+            row = json.loads(raw)
+        except Exception:
+            continue
+        source_pod = row.get("source_pod", "unknown")
+        target_service = row.get("target_service", "unknown")
+        source_node = row.get("source_node") or "unknown"
+        path = f"{source_pod}->{target_service}"
+        metrics = parse_probe_kv(row.get("probe", ""))
+
+        if metrics.get("code") is not None:
+            path_stats[path]["code"].append(float(metrics["code"]))
+        for metric in ("dns", "connect", "ttfb", "total"):
+            if metric in metrics:
+                path_stats[path][metric].append(metrics[metric])
+
+        if "total" in metrics and source_node != "unknown":
+            node_pair_totals[(source_node, target_service)].append(metrics["total"])
+
+        target_nodes = service_to_nodes.get(target_service, set())
+        if source_node and target_nodes:
+            all_total += 1
+            if source_node in target_nodes:
+                same_node_total += 1
+
+    summary = {}
+    total_samples = 0
+    for path, metrics in path_stats.items():
+        totals = sorted(metrics.get("total", []))
+        if not totals:
+            continue
+        total_samples += len(totals)
+        connect_list = metrics.get("connect", [])
+        ttfb_list = metrics.get("ttfb", [])
+        queueing_list = [
+            t - c for t, c in zip(ttfb_list, connect_list)
+            if t is not None and c is not None
+        ]
+        summary[path] = {
+            "samples": len(totals),
+            "total_avg_ms": safe_mean(totals),
+            "total_p95_ms": percentile(totals, 95),
+            "total_p99_ms": percentile(totals, 99),
+            "dns_avg_ms": safe_mean(metrics.get("dns", [])),
+            "connect_avg_ms": safe_mean(connect_list),
+            "ttfb_avg_ms": safe_mean(ttfb_list),
+            "queueing_avg_ms": safe_mean(queueing_list) if queueing_list else None,
+            "error_rate": (
+                len([c for c in metrics.get("code", []) if int(c) >= 400]) / len(metrics.get("code", []))
+                if metrics.get("code")
+                else None
+            ),
+        }
+
+    node_pair_summary = {}
+    for (src_node, tgt_svc), totals in node_pair_totals.items():
+        if not totals:
+            continue
+        key = f"{src_node} -> {tgt_svc}"
+        node_pair_summary[key] = {
+            "source_node": src_node,
+            "target_service": tgt_svc,
+            "samples": len(totals),
+            "total_avg_ms": safe_mean(totals),
+            "total_p95_ms": percentile(sorted(totals), 95),
+            "total_p99_ms": percentile(sorted(totals), 99),
+        }
+
+    global_summary = {
+        "path_count": len(summary),
+        "total_samples": total_samples,
+        "intra_node_ratio": (same_node_total / all_total) if all_total > 0 else None,
+    }
+    return {
+        "path_summary": summary,
+        "global_summary": global_summary,
+        "node_pair_summary": node_pair_summary,
+    }
+
+
+def write_json(path: Path, payload: dict) -> None:
+    path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
+
+
+def load_hpa_snapshots(network_dir: Path) -> List[Tuple[str, dict]]:
+    """Load HPA snapshots; return list of (timestamp, {hpa_name: {desired, current}})."""
+    out = []
+    for p in sorted(network_dir.glob("hpa-*.json")):
+        payload = load_json(p)
+        if not payload:
+            continue
+        ts = detect_timestamp_from_name(p, "hpa-")
+        if ts == "unknown" or not ts.replace("-", "").replace("_", "").isdigit():
+            continue
+        per_hpa = {}
+        for item in payload.get("items", []):
+            name = (item.get("metadata") or {}).get("name")
+            if not name:
+                continue
+            status = item.get("status") or {}
+            per_hpa[name] = {
+                "desired": status.get("desiredReplicas"),
+                "current": status.get("currentReplicas"),
+            }
+        if per_hpa:
+            out.append((ts, per_hpa))
+    return out
+
+
+def build_latency_vs_replicas(
+    network_dir: Path,
+    hpa_snapshots: List[Tuple[str, dict]],
+) -> Optional[Path]:
+    """Build latency-vs-replicas.csv from HPA snapshots and s2s probes grouped by timestamp."""
+    p = network_dir / "service-to-service-latency.jsonl"
+    if not p.exists() or not hpa_snapshots:
+        return None
+
+    # Group s2s probes by timestamp -> list of total ms
+    by_ts: Dict[str, List[float]] = defaultdict(list)
+    for raw in p.read_text().splitlines():
+        raw = raw.strip()
+        if not raw:
+            continue
         try:
-            with open(file_path, 'r') as f:
-                content = f.read()
-                timestamp_match = re.search(r'Timestamp: (\S+)', content)
-                if timestamp_match:
-                    timestamp = timestamp_match.group(1)
-                    data['pod_latencies'].append({
-                        'timestamp': timestamp,
-                        'content': content,
-                        'file': file_path
-                    })
-        except Exception as e:
-            print(f"Warning: Could not load {file_path}: {e}")
-    
-    # Load node network info
-    for file_path in sorted(glob.glob(os.path.join(network_dir, "node-network-*.json"))):
-        try:
-            with open(file_path, 'r') as f:
-                data['node_network'].append(json.load(f))
-        except Exception as e:
-            print(f"Warning: Could not load {file_path}: {e}")
-    
-    return data
+            row = json.loads(raw)
+        except Exception:
+            continue
+        ts = row.get("timestamp")
+        if not ts:
+            continue
+        metrics = parse_probe_kv(row.get("probe", ""))
+        if "total" in metrics:
+            by_ts[ts].append(metrics["total"])
+
+    # All HPA names across snapshots
+    all_hpa_names = set()
+    for _, per_hpa in hpa_snapshots:
+        all_hpa_names.update(per_hpa.keys())
+    all_hpa_names = sorted(all_hpa_names)
+
+    # Build rows: timestamp, then per-HPA desired/current, then s2s_p95_ms, s2s_p99_ms
+    csv_path = network_dir / "latency-vs-replicas.csv"
+    rows = []
+    for ts, per_hpa in hpa_snapshots:
+        totals_at_ts = sorted(by_ts.get(ts, []))
+        s2s_p95 = percentile(totals_at_ts, 95) if totals_at_ts else None
+        s2s_p99 = percentile(totals_at_ts, 99) if totals_at_ts else None
+        row = {"timestamp": ts}
+        for name in all_hpa_names:
+            info = per_hpa.get(name, {})
+            row[f"{name}_desired"] = info.get("desired", "")
+            row[f"{name}_current"] = info.get("current", "")
+        row["s2s_p95_ms"] = f"{s2s_p95:.2f}" if s2s_p95 is not None else ""
+        row["s2s_p99_ms"] = f"{s2s_p99:.2f}" if s2s_p99 is not None else ""
+        rows.append(row)
+
+    # Also include timestamps that have s2s but no HPA (e.g. partial overlap)
+    hpa_ts_set = {r[0] for r in hpa_snapshots}
+    for ts in by_ts:
+        if ts in hpa_ts_set:
+            continue
+        totals_at_ts = sorted(by_ts[ts])
+        row = {"timestamp": ts}
+        for n in all_hpa_names:
+            row[f"{n}_desired"] = ""
+            row[f"{n}_current"] = ""
+        row["s2s_p95_ms"] = f"{percentile(totals_at_ts, 95):.2f}" if totals_at_ts else ""
+        row["s2s_p99_ms"] = f"{percentile(totals_at_ts, 99):.2f}" if totals_at_ts else ""
+        rows.append(row)
+    rows.sort(key=lambda r: r["timestamp"])
+
+    header = ["timestamp"] + [f"{n}_desired" for n in all_hpa_names] + [f"{n}_current" for n in all_hpa_names] + ["s2s_p95_ms", "s2s_p99_ms"]
+    with open(csv_path, "w") as f:
+        f.write(",".join(header) + "\n")
+        for row in rows:
+            f.write(",".join(str(row.get(h, "")) for h in header) + "\n")
+    return csv_path
 
 
-def analyze_pod_placement(data, output_dir):
-    """Analyze pod placement patterns over time."""
-    print("\n=== Pod Placement Analysis ===")
-    
-    output_file = os.path.join(output_dir, "pod-placement-analysis.txt")
-    
-    with open(output_file, 'w') as f:
-        f.write("Pod Placement Analysis\n")
-        f.write("=" * 60 + "\n\n")
-        
-        if not data['pod_network']:
-            f.write("No pod network data available.\n")
-            return
-        
-        # Track pod movements
-        pod_locations = defaultdict(list)
-        node_pod_counts = defaultdict(lambda: defaultdict(int))
-        
-        for snapshot in data['pod_network']:
-            timestamp = snapshot.get('timestamp', 'unknown')
-            
-            for pod in snapshot.get('pods', []):
-                pod_name = pod.get('name', 'unknown')
-                node = pod.get('node', 'unknown')
-                app = pod.get('app', 'unknown')
-                
-                pod_locations[pod_name].append({
-                    'timestamp': timestamp,
-                    'node': node,
-                    'app': app,
-                    'podIP': pod.get('podIP'),
-                    'phase': pod.get('phase')
-                })
-                
-                if app != 'unknown':
-                    node_pod_counts[timestamp][node] += 1
-        
-        # Report pod movements (pods that changed nodes)
-        f.write("Pod Movements:\n")
-        f.write("-" * 60 + "\n")
-        movements_found = False
-        for pod_name, locations in pod_locations.items():
-            nodes = [loc['node'] for loc in locations]
-            unique_nodes = set(nodes)
-            if len(unique_nodes) > 1:
-                movements_found = True
-                f.write(f"\n{pod_name}:\n")
-                for loc in locations:
-                    f.write(f"  {loc['timestamp']}: {loc['node']} ({loc['phase']})\n")
-        
-        if not movements_found:
-            f.write("  No pod movements detected (pods remained on same nodes)\n")
-        
-        f.write("\n\n")
-        
-        # Pod distribution per node over time
-        f.write("Pod Distribution Over Time:\n")
-        f.write("-" * 60 + "\n")
-        for timestamp in sorted(node_pod_counts.keys())[:10]:  # Show first 10 samples
-            f.write(f"\n{timestamp}:\n")
-            for node, count in sorted(node_pod_counts[timestamp].items()):
-                f.write(f"  {node}: {count} pods\n")
-        
-        if len(node_pod_counts) > 10:
-            f.write(f"\n... (showing first 10 of {len(node_pod_counts)} samples)\n")
-        
-        # Service-specific placement
-        f.write("\n\nService Placement Patterns:\n")
-        f.write("-" * 60 + "\n")
-        
-        service_nodes = defaultdict(set)
-        for snapshot in data['pod_network']:
-            for pod in snapshot.get('pods', []):
-                app = pod.get('app')
-                node = pod.get('node')
-                if app and node:
-                    service_nodes[app].add(node)
-        
-        for service, nodes in sorted(service_nodes.items()):
-            f.write(f"\n{service}:\n")
-            f.write(f"  Nodes used: {', '.join(sorted(nodes))}\n")
-            f.write(f"  Node diversity: {len(nodes)}\n")
-    
-    print(f"✓ Generated: {output_file}")
+def write_text_report(
+    network_dir: Path,
+    placement: dict,
+    e2e: dict,
+    s2s: dict,
+) -> None:
+    lines = []
+    lines.append("Network Analysis Summary")
+    lines.append("=" * 80)
+    lines.append("")
+    lines.append("1) Node -> Pods (latest snapshot)")
+    lines.append("-" * 80)
+    lines.append(f"Latest timestamp: {placement.get('latest_timestamp', 'n/a')}")
+    latest = placement.get("latest_node_to_pods", {})
+    if not latest:
+        lines.append("No pod snapshots found.")
+    else:
+        for node, pods in sorted(latest.items()):
+            lines.append(f"{node}: {len(pods)} pods")
+            for pod in pods:
+                lines.append(f"  - {pod}")
+    lines.append("")
+    lines.append(f"Pods that moved nodes: {len(placement.get('pod_movements', {}))}")
+    lines.append("")
+    lines.append("2) End-to-end Latency (frontend endpoints)")
+    lines.append("-" * 80)
+    cluster = e2e.get("cluster_summary", {})
+    lines.append(f"Burst count: {cluster.get('burst_count', 0)}")
+    lines.append(f"Combined actual QPS avg: {cluster.get('combined_actual_qps_avg')}")
+    lines.append(f"Combined actual QPS p95: {cluster.get('combined_actual_qps_p95')}")
+    lines.append(f"Combined actual QPS max: {cluster.get('combined_actual_qps_max')}")
+    lines.append("")
+    for endpoint, data in sorted(e2e.get("endpoint_summary", {}).items()):
+        lines.append(f"{endpoint}:")
+        lines.append(f"  runs={data.get('runs', 0)} avg_qps={data.get('avg_actual_qps')}")
+        lines.append(f"  p95 median={format_ms(data.get('p95_ms_median'))} max={format_ms(data.get('p95_ms_max'))}")
+        lines.append(f"  p99 median={format_ms(data.get('p99_ms_median'))} max={format_ms(data.get('p99_ms_max'))}")
+    lines.append("")
+    lines.append("3) Service-to-Service Latency")
+    lines.append("-" * 80)
+    g = s2s.get("global_summary", {})
+    lines.append(f"Measured paths: {g.get('path_count', 0)}")
+    lines.append(f"Latency samples: {g.get('total_samples', 0)}")
+    lines.append(f"Intra-node ratio: {g.get('intra_node_ratio')}")
+    lines.append("")
+    top_paths = sorted(
+        s2s.get("path_summary", {}).items(),
+        key=lambda item: (item[1].get("total_p95_ms") or -1),
+        reverse=True,
+    )[:12]
+    for path, metric in top_paths:
+        lines.append(f"{path}")
+        lines.append(
+            f"  avg={format_ms(metric.get('total_avg_ms'))} "
+            f"p95={format_ms(metric.get('total_p95_ms'))} "
+            f"p99={format_ms(metric.get('total_p99_ms'))} "
+            f"err={metric.get('error_rate')}"
+        )
+
+    lines.append("")
+    lines.append("4) Queueing vs network decomposition (connect vs ttfb-connect)")
+    lines.append("-" * 80)
+    lines.append("  connect ≈ network RTT; queueing_avg = ttfb - connect ≈ server/queue delay")
+    path_summary = s2s.get("path_summary", {})
+    if path_summary:
+        connect_vals = []
+        queueing_vals = []
+        for path, metric in sorted(path_summary.items(), key=lambda x: (x[1].get("total_p95_ms") or 0), reverse=True)[:15]:
+            c = metric.get("connect_avg_ms")
+            q = metric.get("queueing_avg_ms")
+            if c is not None:
+                connect_vals.append(c)
+            if q is not None:
+                queueing_vals.append(q)
+            lines.append(f"  {path}")
+            lines.append(f"    connect_avg={format_ms(c)}  queueing_avg(ttfb-connect)={format_ms(q)}  total_avg={format_ms(metric.get('total_avg_ms'))}")
+        if connect_vals or queueing_vals:
+            lines.append("")
+            lines.append(f"  Global (across shown paths): connect_avg={format_ms(safe_mean(connect_vals))}  queueing_avg={format_ms(safe_mean(queueing_vals))}")
+    else:
+        lines.append("  No path-level probe data.")
+    lines.append("")
+    lines.append("5) Tail latency by (source_node, target_service)")
+    lines.append("-" * 80)
+    node_pair = s2s.get("node_pair_summary", {})
+    if node_pair:
+        top_pairs = sorted(
+            node_pair.items(),
+            key=lambda x: (x[1].get("total_p95_ms") or -1),
+            reverse=True,
+        )[:15]
+        for key, m in top_pairs:
+            lines.append(f"  {key}: samples={m.get('samples', 0)} p95={format_ms(m.get('total_p95_ms'))} p99={format_ms(m.get('total_p99_ms'))}")
+    else:
+        lines.append("  No node-pair aggregation (need s2s probes with source_node).")
+
+    (network_dir / "analysis-summary.txt").write_text("\n".join(lines) + "\n")
 
 
-def analyze_pod_latencies(data, output_dir):
-    """Analyze pod-to-pod latencies."""
-    print("\n=== Pod-to-Pod Latency Analysis ===")
-    
-    output_file = os.path.join(output_dir, "pod-latency-analysis.txt")
-    
-    with open(output_file, 'w') as f:
-        f.write("Pod-to-Pod Latency Analysis\n")
-        f.write("=" * 60 + "\n\n")
-        
-        if not data['pod_latencies']:
-            f.write("No pod latency data available.\n")
-            return
-        
-        f.write(f"Total latency measurements: {len(data['pod_latencies'])}\n\n")
-        
-        # Parse latencies from text files
-        latency_data = defaultdict(list)
-        
-        for measurement in data['pod_latencies']:
-            content = measurement['content']
-            timestamp = measurement['timestamp']
-            
-            # Parse pod-to-service latencies
-            current_pod = None
-            for line in content.split('\n'):
-                if line.startswith('Source:'):
-                    current_pod = line.split(':')[1].strip()
-                elif '->' in line and current_pod:
-                    match = re.search(r'-> (\S+): (\S+)', line)
-                    if match:
-                        target = match.group(1)
-                        latency_str = match.group(2)
-                        if latency_str != 'N/A':
-                            try:
-                                # Parse latency (could be in various formats)
-                                latency_ms = float(latency_str.replace('ms', '').replace('s', '')) * 1000
-                                latency_data[f"{current_pod}->{target}"].append({
-                                    'timestamp': timestamp,
-                                    'latency_ms': latency_ms
-                                })
-                            except ValueError:
-                                pass
-        
-        # Report average latencies per path
-        f.write("Average Latencies by Communication Path:\n")
-        f.write("-" * 60 + "\n")
-        
-        for path, measurements in sorted(latency_data.items()):
-            if measurements:
-                latencies = [m['latency_ms'] for m in measurements]
-                f.write(f"\n{path}:\n")
-                f.write(f"  Samples: {len(latencies)}\n")
-                f.write(f"  Min: {min(latencies):.2f}ms\n")
-                f.write(f"  Mean: {np.mean(latencies):.2f}ms\n")
-                f.write(f"  Max: {max(latencies):.2f}ms\n")
-                f.write(f"  Std Dev: {np.std(latencies):.2f}ms\n")
-    
-    print(f"✓ Generated: {output_file}")
-
-
-def analyze_service_topology(data, output_dir):
-    """Analyze service endpoint topology."""
-    print("\n=== Service Topology Analysis ===")
-    
-    output_file = os.path.join(output_dir, "service-topology-analysis.txt")
-    
-    with open(output_file, 'w') as f:
-        f.write("Service Topology Analysis\n")
-        f.write("=" * 60 + "\n\n")
-        
-        if not data['service_endpoints']:
-            f.write("No service endpoint data available.\n")
-            return
-        
-        # Analyze latest snapshot
-        latest = data['service_endpoints'][-1]
-        
-        f.write("Service Endpoint Distribution:\n")
-        f.write("-" * 60 + "\n")
-        
-        for endpoint in latest.get('endpoints', []):
-            service_name = endpoint.get('service', 'unknown')
-            f.write(f"\n{service_name}:\n")
-            
-            for subset in endpoint.get('subsets', []):
-                addresses = subset.get('addresses', [])
-                f.write(f"  Endpoints: {len(addresses)}\n")
-                
-                # Group by node
-                by_node = defaultdict(list)
-                for addr in addresses:
-                    node = addr.get('nodeName', 'unknown')
-                    ip = addr.get('ip', 'unknown')
-                    by_node[node].append(ip)
-                
-                for node, ips in sorted(by_node.items()):
-                    f.write(f"    {node}: {len(ips)} endpoints\n")
-                    for ip in ips:
-                        f.write(f"      - {ip}\n")
-    
-    print(f"✓ Generated: {output_file}")
-
-
-def generate_visualizations(data, output_dir):
-    """Generate visualization graphs."""
-    if not HAS_MATPLOTLIB:
-        print("\nSkipping visualizations (matplotlib not available)")
-        return
-    
-    print("\n=== Generating Visualizations ===")
-    
-    # Graph 1: Pod count per node over time
-    if data['pod_network']:
-        fig, ax = plt.subplots(figsize=(14, 6))
-        
-        node_counts = defaultdict(lambda: defaultdict(int))
-        timestamps = []
-        
-        for idx, snapshot in enumerate(data['pod_network']):
-            timestamps.append(idx)
-            for pod in snapshot.get('pods', []):
-                node = pod.get('node', 'unknown')
-                if node != 'unknown':
-                    node_counts[node][idx] += 1
-        
-        for node, counts in node_counts.items():
-            x = sorted(counts.keys())
-            y = [counts[i] for i in x]
-            ax.plot(x, y, marker='o', label=node, linewidth=2, markersize=4)
-        
-        ax.set_xlabel('Sample Index', fontsize=12)
-        ax.set_ylabel('Number of Pods', fontsize=12)
-        ax.set_title('Pod Distribution Across Nodes Over Time', fontsize=14, fontweight='bold')
-        ax.legend(loc='best', fontsize=10)
-        ax.grid(True, alpha=0.3)
-        
-        plt.tight_layout()
-        output_path = os.path.join(output_dir, "pod-distribution-timeline.png")
-        plt.savefig(output_path, dpi=300, bbox_inches='tight')
-        print(f"✓ Generated: {output_path}")
-        plt.close()
-
-
-def main():
-    parser = argparse.ArgumentParser(
-        description="Analyze detailed network data from load tests"
+def write_recommendations(network_dir: Path, placement: dict, e2e: dict, s2s: dict) -> None:
+    lines = []
+    lines.append("# Suggested Extra Metrics for Network-Aware Pod Allocation")
+    lines.append("")
+    lines.append("1. **Cross-node request ratio per service path**")
+    lines.append("   - Why: directly measures how often calls leave the node and pay overlay/network penalty.")
+    lines.append("   - How: join source pod node with target endpoint node for each service-to-service sample.")
+    lines.append("")
+    lines.append("2. **Network-latency amplification under autoscaling**")
+    lines.append("   - Why: tracks whether p95/p99 service latency worsens when replica counts increase.")
+    lines.append("   - How: correlate `hpa-*.json` desired/current replicas with service path p95.")
+    lines.append("")
+    lines.append("3. **Tail-latency skew by node pair**")
+    lines.append("   - Why: identifies problematic node-to-node paths instead of only service-wide averages.")
+    lines.append("   - How: aggregate p95/p99 on `(source_node, target_node)` dimensions.")
+    lines.append("")
+    lines.append("4. **Queueing vs network decomposition**")
+    lines.append("   - Why: helps separate app saturation from pure network effects.")
+    lines.append("   - How: compare `connect` and `ttfb` from probes; rising `ttfb-connect` indicates app/queue delay.")
+    lines.append("")
+    lines.append("5. **Replica locality efficiency score**")
+    lines.append("   - Why: single objective metric for scheduler experiments.")
+    lines.append("   - How: weighted score using intra-node ratio, p95 total latency, and error rate.")
+    lines.append("")
+    lines.append("## Current Run Quick Facts")
+    lines.append("")
+    lines.append(f"- Pod snapshots: {placement.get('snapshot_count', 0)}")
+    lines.append(f"- Pod movements detected: {len(placement.get('pod_movements', {}))}")
+    lines.append(f"- Endpoint groups analyzed: {len(e2e.get('endpoint_summary', {}))}")
+    lines.append(f"- Service path samples: {s2s.get('global_summary', {}).get('total_samples', 0)}")
+    lines.append(
+        f"- Combined max actual QPS: {e2e.get('cluster_summary', {}).get('combined_actual_qps_max')}"
     )
+    lines.append("")
+    lines.append("## Implemented in this run")
+    lines.append("")
+    lines.append("- **Latency vs replica count**: see `latency-vs-replicas.csv` (HPA desired/current vs s2s p95/p99 per timestamp).")
+    lines.append("- **Tail latency by (source_node, target_service)**: see `node-pair-latency-summary.json` and section 5 of `analysis-summary.txt`.")
+    lines.append("- **Queueing vs network**: see section 4 of `analysis-summary.txt` (connect_avg vs queueing_avg = ttfb - connect per path).")
+
+    (network_dir / "experiment-metrics-recommendations.md").write_text("\n".join(lines) + "\n")
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Analyze network + load data.")
     parser.add_argument(
         "data_dir",
         nargs="?",
-        help="Path to data directory (e.g., stage1-baseline/data/20260214-191727)"
+        help="Path to run dir (defaults to latest under ./data)",
     )
-    
-    args = parser.parse_args()
-    
-    # Determine data directory
-    if args.data_dir:
-        data_dir = args.data_dir
-    else:
-        # Find latest data directory
-        script_dir = Path(__file__).parent
-        data_base = script_dir / "data"
-        if not data_base.exists():
-            print(f"Error: No data directory found at {data_base}")
-            sys.exit(1)
-        
-        run_dirs = sorted([d for d in data_base.iterdir() if d.is_dir()], reverse=True)
-        if not run_dirs:
-            print(f"Error: No run directories found in {data_base}")
-            sys.exit(1)
-        
-        data_dir = str(run_dirs[0])
-        print(f"Using latest run: {os.path.basename(data_dir)}")
-    
-    if not os.path.exists(data_dir):
-        print(f"Error: Data directory not found: {data_dir}")
+    return parser.parse_args()
+
+
+def discover_data_dir(cli_path: Optional[str], script_dir: Path) -> Path:
+    if cli_path:
+        return Path(cli_path).expanduser().resolve()
+    data_root = script_dir / "data"
+    if not data_root.exists():
+        raise FileNotFoundError(f"No data directory found at: {data_root}")
+    run_dirs = sorted([p for p in data_root.iterdir() if p.is_dir()], reverse=True)
+    if not run_dirs:
+        raise FileNotFoundError(f"No run directories found under: {data_root}")
+    return run_dirs[0]
+
+
+def main() -> None:
+    args = parse_args()
+    script_dir = Path(__file__).parent
+    try:
+        data_dir = discover_data_dir(args.data_dir, script_dir)
+    except FileNotFoundError as exc:
+        print(f"Error: {exc}")
         sys.exit(1)
-    
-    # Create output directory
-    output_dir = os.path.join(data_dir, "network-analysis")
-    os.makedirs(output_dir, exist_ok=True)
-    
-    print(f"\n{'=' * 60}")
-    print(f"Network Data Analysis")
-    print(f"{'=' * 60}")
+
+    load_dir = data_dir / "loadgen"
+    network_dir = data_dir / "network-analysis"
+    if not load_dir.exists() or not network_dir.exists():
+        print("Error: expected both loadgen/ and network-analysis/ directories in run data.")
+        sys.exit(1)
+
+    pod_snapshots = load_pod_snapshots(network_dir)
+    service_to_nodes = load_service_endpoint_nodes(network_dir)
+    placement = summarize_pod_placement(pod_snapshots)
+    e2e = load_e2e_latency(load_dir)
+    s2s = load_service_to_service(network_dir, service_to_nodes)
+
+    write_json(network_dir / "pod-placement-analysis.json", placement)
+    write_json(network_dir / "e2e-latency-summary.json", e2e)
+    write_json(network_dir / "service-to-service-latency-summary.json", {
+        "path_summary": s2s["path_summary"],
+        "global_summary": s2s["global_summary"],
+    })
+    write_json(network_dir / "node-pair-latency-summary.json", {
+        "by_source_node_target_service": s2s.get("node_pair_summary", {}),
+    })
+    write_text_report(network_dir, placement, e2e, s2s)
+    write_recommendations(network_dir, placement, e2e, s2s)
+
+    hpa_snapshots = load_hpa_snapshots(network_dir)
+    latency_vs_replicas_path = build_latency_vs_replicas(network_dir, hpa_snapshots)
+
+    print("=" * 72)
+    print("Analysis complete")
+    print("=" * 72)
     print(f"Data directory: {data_dir}")
-    print(f"Output directory: {output_dir}")
-    
-    # Load data
-    print("\nLoading network data...")
-    data = load_network_data(data_dir)
-    
-    if not data:
-        sys.exit(1)
-    
-    print(f"  Pod network snapshots: {len(data['pod_network'])}")
-    print(f"  Service endpoints: {len(data['service_endpoints'])}")
-    print(f"  Pod latency measurements: {len(data['pod_latencies'])}")
-    print(f"  Node network snapshots: {len(data['node_network'])}")
-    
-    # Perform analyses
-    analyze_pod_placement(data, output_dir)
-    analyze_pod_latencies(data, output_dir)
-    analyze_service_topology(data, output_dir)
-    generate_visualizations(data, output_dir)
-    
-    print(f"\n{'=' * 60}")
-    print("Analysis complete!")
-    print(f"{'=' * 60}")
-    print(f"\nResults in: {output_dir}")
-    print("  - pod-placement-analysis.txt")
-    print("  - pod-latency-analysis.txt")
-    print("  - service-topology-analysis.txt")
-    if HAS_MATPLOTLIB:
-        print("  - pod-distribution-timeline.png")
-    print("")
+    print(f"Generated: {network_dir / 'analysis-summary.txt'}")
+    print(f"Generated: {network_dir / 'pod-placement-analysis.json'}")
+    print(f"Generated: {network_dir / 'e2e-latency-summary.json'}")
+    print(f"Generated: {network_dir / 'service-to-service-latency-summary.json'}")
+    print(f"Generated: {network_dir / 'node-pair-latency-summary.json'}")
+    if latency_vs_replicas_path:
+        print(f"Generated: {latency_vs_replicas_path}")
+    print(f"Generated: {network_dir / 'experiment-metrics-recommendations.md'}")
 
 
 if __name__ == "__main__":

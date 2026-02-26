@@ -23,21 +23,30 @@ except ImportError:
 
 
 def load_burst_data(data_dir):
-    """Load latency data from all fortio burst files."""
+    """Load latency data from all fortio burst files.
+    Supports both fortio-burst-N.json and fortio-burst-N-{home,product,cart}.json.
+    """
     loadgen_dir = os.path.join(data_dir, "loadgen")
     burst_files = sorted(glob.glob(os.path.join(loadgen_dir, "fortio-burst-*.json")))
-    
+
     bursts = []
     for file_path in burst_files:
         with open(file_path, 'r') as f:
             data = json.load(f)
-        
-        # Extract percentiles
+
+        # Parse index: fortio-burst-0.json -> 0; fortio-burst-0-home.json -> 0
+        base = os.path.basename(file_path).replace(".json", "").replace("fortio-burst-", "")
+        parts = base.split("-")
+        try:
+            burst_index = int(parts[0])
+        except (ValueError, IndexError):
+            burst_index = len(bursts)
+
         percentiles = {p["Percentile"]: p["Value"] for p in data.get("DurationHistogram", {}).get("Percentiles", [])}
-        
+
         burst_info = {
             "file": os.path.basename(file_path),
-            "index": int(os.path.basename(file_path).replace("fortio-burst-", "").replace(".json", "")),
+            "index": burst_index,
             "requested_qps": float(data.get("RequestedQPS", 0)),
             "actual_qps": data.get("ActualQPS", 0),
             "duration_ns": data.get("ActualDuration", 0),
@@ -52,48 +61,69 @@ def load_burst_data(data_dir):
             "count": data.get("DurationHistogram", {}).get("Count", 0),
         }
         bursts.append(burst_info)
-    
-    return sorted(bursts, key=lambda x: x["index"])
+
+    return sorted(bursts, key=lambda x: (x["index"], x["file"]))
 
 
 def load_pod_placement_data(data_dir):
-    """Load pod placement snapshots over time."""
+    """Load pod placement snapshots over time.
+    Prefers pod-placement/ (index.jsonl + pods-*.json); falls back to network-analysis/pod-network-*.json.
+    """
     placement_dir = os.path.join(data_dir, "pod-placement")
-    if not os.path.exists(placement_dir):
-        return None
-    
-    index_file = os.path.join(placement_dir, "index.jsonl")
-    if not os.path.exists(index_file):
-        return None
-    
-    snapshots = []
-    with open(index_file, 'r') as f:
-        for line in f:
-            entry = json.loads(line.strip())
-            snapshot_file = os.path.join(placement_dir, entry["file"])
-            
-            if not os.path.exists(snapshot_file):
-                continue
-            
-            with open(snapshot_file, 'r') as sf:
-                snapshot_data = json.load(sf)
-            
-            # Count pods per node (only default namespace)
+    network_dir = os.path.join(data_dir, "network-analysis")
+
+    # Try legacy pod-placement/ first
+    if os.path.exists(placement_dir):
+        index_file = os.path.join(placement_dir, "index.jsonl")
+        if os.path.exists(index_file):
+            snapshots = []
+            with open(index_file, 'r') as f:
+                for line in f:
+                    entry = json.loads(line.strip())
+                    snapshot_file = os.path.join(placement_dir, entry["file"])
+                    if not os.path.exists(snapshot_file):
+                        continue
+                    with open(snapshot_file, 'r') as sf:
+                        snapshot_data = json.load(sf)
+                    node_counts = defaultdict(int)
+                    for pod in snapshot_data.get("items", []):
+                        if pod.get("metadata", {}).get("namespace") == "default":
+                            node = pod.get("spec", {}).get("nodeName", "unknown")
+                            if node and node != "unknown":
+                                node_counts[node] += 1
+                    snapshots.append({
+                        "timestamp": entry["timestamp"],
+                        "file": entry["file"],
+                        "index": int(entry["file"].replace("pods-", "").replace(".json", "")),
+                        "node_counts": dict(node_counts),
+                    })
+            if snapshots:
+                return sorted(snapshots, key=lambda x: x["index"])
+
+    # Fallback: network-analysis/pod-network-*.json (from 03e)
+    if os.path.exists(network_dir):
+        pod_files = sorted(glob.glob(os.path.join(network_dir, "pod-network-*.json")))
+        snapshots = []
+        for i, file_path in enumerate(pod_files):
+            with open(file_path, 'r') as f:
+                snapshot_data = json.load(f)
+            stem = os.path.basename(file_path).replace("pod-network-", "").replace(".json", "")
             node_counts = defaultdict(int)
             for pod in snapshot_data.get("items", []):
                 if pod.get("metadata", {}).get("namespace") == "default":
                     node = pod.get("spec", {}).get("nodeName", "unknown")
                     if node and node != "unknown":
                         node_counts[node] += 1
-            
             snapshots.append({
-                "timestamp": entry["timestamp"],
-                "file": entry["file"],
-                "index": int(entry["file"].replace("pods-", "").replace(".json", "")),
+                "timestamp": stem,
+                "file": os.path.basename(file_path),
+                "index": i,
                 "node_counts": dict(node_counts),
             })
-    
-    return sorted(snapshots, key=lambda x: x["index"])
+        if snapshots:
+            return snapshots
+
+    return None
 
 
 def plot_latency_percentiles(bursts, output_dir):
