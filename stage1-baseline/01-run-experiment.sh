@@ -13,18 +13,18 @@ KUBECONFIG_PATH="${KUBECONFIG_PATH:-$HOME/.kube/config}"
 #   prep    -> deploy + setup HPA only
 MODE="${MODE:-full}"
 
-# Shared defaults
-CPU_THRESHOLD="${CPU_THRESHOLD:-75}"
+# Shared defaults (lower CPU_THRESHOLD = more replicas for same load; 50% helps reach 7–8 pods)
+CPU_THRESHOLD="${CPU_THRESHOLD:-50}"
 RUN_ID="${RUN_ID:-$(date +"%Y%m%d-%H%M%S")}"
 export RUN_ID
 
-# Bursty high-load defaults (override as needed)
-BURSTS="${BURSTS:-20}"
-BASE_BURST_SECONDS="${BASE_BURST_SECONDS:-50}"
-MAX_BURST_SECONDS="${MAX_BURST_SECONDS:-120}"
-MAX_SLEEP_SECONDS="${MAX_SLEEP_SECONDS:-10}"
-QPS_FLOOR="${QPS_FLOOR:-400}"
-QPS_CEIL="${QPS_CEIL:-4500}"
+# Bursty high-load defaults (override as needed) – long bursts so HPA sees sustained high CPU
+BURSTS="${BURSTS:-18}"
+BASE_BURST_SECONDS="${BASE_BURST_SECONDS:-90}"
+MAX_BURST_SECONDS="${MAX_BURST_SECONDS:-180}"
+MAX_SLEEP_SECONDS="${MAX_SLEEP_SECONDS:-5}"
+QPS_FLOOR="${QPS_FLOOR:-600}"
+QPS_CEIL="${QPS_CEIL:-6000}"
 THREADS_PER_ENDPOINT="${THREADS_PER_ENDPOINT:-48}"
 SAMPLE_INTERVAL="${SAMPLE_INTERVAL:-8}"
 

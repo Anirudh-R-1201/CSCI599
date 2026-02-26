@@ -17,7 +17,7 @@ See **REQUIREMENTS.md** for how each original requirement is covered.
 cd ~/CSCI599/stage1-baseline
 
 # Full run: deploy, set HPA, run bursty load, collect baseline snapshots
-MODE=full CPU_THRESHOLD=75 ./01-run-experiment.sh
+MODE=full ./01-run-experiment.sh
 
 # Analyze latest run
 ./02-analyze-results.sh
@@ -34,18 +34,20 @@ MODE=full CPU_THRESHOLD=75 ./01-run-experiment.sh
 Useful variables:
 
 - `CPU_THRESHOLD` (default `75`)
-- `BURSTS` (default `20`)
-- `BASE_BURST_SECONDS` (default `50`), `MAX_BURST_SECONDS` (default `120`)
-- `MAX_SLEEP_SECONDS` (default `10`)
-- `QPS_FLOOR` (default `400`)
-- `QPS_CEIL` (default `4500`)
+- `CPU_THRESHOLD` (default `50`) – lower = more replicas for same load (helps reach 7–8 pods)
+- `BURSTS` (default `18`)
+- `BASE_BURST_SECONDS` (default `90`), `MAX_BURST_SECONDS` (default `180`) – long bursts so HPA sees sustained high CPU
+- `MAX_SLEEP_SECONDS` (default `5`)
+- `QPS_FLOOR` (default `600`)
+- `QPS_CEIL` (default `6000`)
 - `THREADS_PER_ENDPOINT` (default `48`)
 - `SAMPLE_INTERVAL` (default `8`)
 
 Example:
 
 ```bash
-MODE=full CPU_THRESHOLD=75 BURSTS=24 QPS_CEIL=5000 ./01-run-experiment.sh
+MODE=full BURSTS=24 QPS_CEIL=8000 ./01-run-experiment.sh
+# If replicas still don't reach 7–8: CPU_THRESHOLD=40
 ```
 
 ## Analysis
