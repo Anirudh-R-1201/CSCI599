@@ -34,16 +34,18 @@ MODE=full CPU_THRESHOLD=75 ./01-run-experiment.sh
 Useful variables:
 
 - `CPU_THRESHOLD` (default `75`)
-- `BURSTS` (default `18`)
-- `QPS_FLOOR` (default `120`)
-- `QPS_CEIL` (default `3200`)
+- `BURSTS` (default `20`)
+- `BASE_BURST_SECONDS` (default `50`), `MAX_BURST_SECONDS` (default `120`)
+- `MAX_SLEEP_SECONDS` (default `10`)
+- `QPS_FLOOR` (default `400`)
+- `QPS_CEIL` (default `4500`)
 - `THREADS_PER_ENDPOINT` (default `48`)
 - `SAMPLE_INTERVAL` (default `8`)
 
 Example:
 
 ```bash
-MODE=full CPU_THRESHOLD=75 BURSTS=24 QPS_FLOOR=280 QPS_CEIL=2800 ./01-run-experiment.sh
+MODE=full CPU_THRESHOLD=75 BURSTS=24 QPS_CEIL=5000 ./01-run-experiment.sh
 ```
 
 ## Analysis
