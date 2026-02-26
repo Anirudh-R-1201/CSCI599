@@ -13,8 +13,8 @@ KUBECONFIG_PATH="${KUBECONFIG_PATH:-$HOME/.kube/config}"
 #   prep    -> deploy + setup HPA only
 MODE="${MODE:-full}"
 
-# Shared defaults (lower CPU_THRESHOLD = more replicas for same load; 50% helps reach 7–8 pods)
-CPU_THRESHOLD="${CPU_THRESHOLD:-50}"
+# Shared defaults (75% CPU target; use CPU_THRESHOLD=50 for more aggressive scaling to 7–8 pods)
+CPU_THRESHOLD="${CPU_THRESHOLD:-75}"
 RUN_ID="${RUN_ID:-$(date +"%Y%m%d-%H%M%S")}"
 export RUN_ID
 
@@ -39,6 +39,17 @@ ensure_cluster() {
   if ! kubectl --kubeconfig "${KUBECONFIG_PATH}" get nodes >/dev/null 2>&1; then
     echo "Error: cannot connect to Kubernetes cluster via ${KUBECONFIG_PATH}"
     exit 1
+  fi
+}
+
+# Approve pending certificate signing requests (e.g. for OVN-Kubernetes / new nodes)
+approve_pending_csrs() {
+  local pending
+  pending=$(kubectl --kubeconfig "${KUBECONFIG_PATH}" get csr -o name 2>/dev/null || true)
+  if [ -n "${pending}" ]; then
+    echo "Approving pending certificate signing requests..."
+    echo "${pending}" | xargs kubectl --kubeconfig "${KUBECONFIG_PATH}" certificate approve 2>/dev/null || true
+    echo "CSR approval done."
   fi
 }
 
@@ -165,6 +176,7 @@ ensure_cluster
 
 case "${MODE}" in
   prep)
+    approve_pending_csrs
     ensure_metrics_server
     deploy_workload_if_needed
     setup_hpa
@@ -173,6 +185,7 @@ case "${MODE}" in
     run_traffic
     ;;
   full)
+    approve_pending_csrs
     ensure_metrics_server
     deploy_workload_if_needed
     setup_hpa

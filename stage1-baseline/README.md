@@ -27,14 +27,13 @@ MODE=full ./01-run-experiment.sh
 
 `01-run-experiment.sh` supports:
 
-- `MODE=full` - deploy + HPA + traffic + baseline collection
-- `MODE=prep` - deploy + HPA only
-- `MODE=traffic` - traffic + telemetry only
+- `MODE=full` – deploy + HPA + traffic + baseline collection (also approves pending CSRs before starting)
+- `MODE=prep` – deploy + HPA only (also approves pending CSRs)
+- `MODE=traffic` – traffic + telemetry only
 
 Useful variables:
 
-- `CPU_THRESHOLD` (default `75`)
-- `CPU_THRESHOLD` (default `50`) – lower = more replicas for same load (helps reach 7–8 pods)
+- `CPU_THRESHOLD` (default `75`) – HPA CPU target %; use 50 for more aggressive scaling
 - `BURSTS` (default `18`)
 - `BASE_BURST_SECONDS` (default `90`), `MAX_BURST_SECONDS` (default `180`) – long bursts so HPA sees sustained high CPU
 - `MAX_SLEEP_SECONDS` (default `5`)
