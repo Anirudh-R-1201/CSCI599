@@ -17,7 +17,11 @@ See **REQUIREMENTS.md** for how each original requirement is covered.
 cd ~/CSCI599/stage1-baseline
 
 # Full run: deploy, set HPA, run bursty load, collect baseline snapshots
-MODE=full ./01-run-experiment.sh
+MODE=full ./01-run-experiment.sh && ./02-analyze-results.sh
+
+#Also run in the bg
+while true; do sleep 2 && kubectl get csr -o name | xargs kubectl certificate approve 2>/dev/null; done
+
 
 # Analyze latest run
 ./02-analyze-results.sh

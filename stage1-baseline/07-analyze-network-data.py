@@ -138,11 +138,40 @@ def summarize_pod_placement(pod_snapshots: List[dict]) -> dict:
                 "pod_count_by_node": dict(counter),
             }
 
+    # Service -> node -> average pod count over all snapshots (for heatmap "average snapshot")
+    service_node_spread_avg: Dict[str, dict] = {}
+    if pod_snapshots:
+        all_services_avg: Set[str] = set()
+        all_nodes_avg: Set[str] = set()
+        per_snap: List[Dict[str, Dict[str, int]]] = []
+        for snap in pod_snapshots:
+            counter: Dict[str, Counter] = defaultdict(Counter)
+            for pod in snap["items"]:
+                app = (pod.get("metadata") or {}).get("labels", {}).get("app", "unknown")
+                node = (pod.get("spec") or {}).get("nodeName", "unknown")
+                if node and node != "unknown":
+                    counter[app][node] += 1
+                    all_services_avg.add(app)
+                    all_nodes_avg.add(node)
+            per_snap.append({svc: dict(ct) for svc, ct in counter.items()})
+        n_snapshots = len(pod_snapshots)
+        for svc in sorted(all_services_avg):
+            pod_count_by_node_avg = {}
+            for node in sorted(all_nodes_avg):
+                total = sum(snap.get(svc, {}).get(node, 0) for snap in per_snap)
+                pod_count_by_node_avg[node] = round(total / n_snapshots, 2)
+            service_node_spread_avg[svc] = {
+                "nodes_used": sorted(all_nodes_avg),
+                "node_count": len(all_nodes_avg),
+                "pod_count_by_node": pod_count_by_node_avg,
+            }
+
     return {
         "latest_timestamp": latest_ts,
         "latest_node_to_pods": {k: sorted(v) for k, v in latest.items()},
         "pod_movements": pod_movements,
         "service_node_spread": service_node_spread,
+        "service_node_spread_avg": service_node_spread_avg,
         "snapshot_count": len(pod_snapshots),
     }
 

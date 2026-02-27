@@ -139,12 +139,14 @@ def load_service_placement(data_dir):
 
 
 def plot_service_placement(placement, output_dir):
-    """Plot which service's pods are on which node (heatmap: service x node, value = pod count)."""
-    spread = placement.get("service_node_spread") if placement else None
+    """Plot which service's pods are on which node (heatmap: service x node, value = pod count, average over snapshots)."""
+    # Prefer average over all snapshots; fall back to latest snapshot
+    spread = placement.get("service_node_spread_avg") or placement.get("service_node_spread") if placement else None
     if not spread:
         print("⚠ No service_node_spread in placement, skipping service placement graph")
         return
 
+    use_avg = bool(placement.get("service_node_spread_avg"))
     services = sorted(spread.keys())
     all_nodes = set()
     for info in spread.values():
@@ -156,7 +158,7 @@ def plot_service_placement(placement, output_dir):
         return n.split(".")[0] if n else n
 
     node_labels = [short_node(n) for n in nodes]
-    # Build matrix: rows = services, cols = nodes (use pod_count_by_node = latest snapshot only; fallback: samples_per_node for legacy)
+    # Build matrix: rows = services, cols = nodes
     data = []
     for svc in services:
         counts = spread[svc].get("pod_count_by_node") or spread[svc].get("samples_per_node", {})
@@ -168,7 +170,8 @@ def plot_service_placement(placement, output_dir):
         return
 
     fig, ax = plt.subplots(figsize=(max(8, len(nodes) * 1.5), max(6, len(services) * 0.4)))
-    im = ax.imshow(data, cmap="Blues", aspect="auto", vmin=0, vmax=max(max(r) for r in data) or 1)
+    vmax = max(max(r) for r in data) or 1
+    im = ax.imshow(data, cmap="Blues", aspect="auto", vmin=0, vmax=vmax)
 
     ax.set_xticks(range(len(nodes)))
     ax.set_xticklabels(node_labels, rotation=45, ha="right")
@@ -177,17 +180,17 @@ def plot_service_placement(placement, output_dir):
 
     ax.set_xlabel("Node", fontsize=12)
     ax.set_ylabel("Service", fontsize=12)
-    ax.set_title("5. Placement: which service's pods are on which node (latest snapshot)", fontsize=12, fontweight="bold")
+    ax.set_title("5. Placement: which service's pods are on which node (average over all snapshots)", fontsize=12, fontweight="bold")
 
     for i in range(len(services)):
         for j in range(len(nodes)):
             v = data[i][j]
             if v > 0:
-                max_val = max(max(r) for r in data) or 1
-                ax.text(j, i, str(int(v)), ha="center", va="center",
-                        color="white" if v >= max_val / 2 else "black", fontsize=10)
+                label = f"{v:.1f}" if use_avg and isinstance(v, float) and v != int(v) else str(int(round(v)))
+                ax.text(j, i, label, ha="center", va="center",
+                        color="white" if v >= vmax / 2 else "black", fontsize=10)
 
-    plt.colorbar(im, ax=ax, label="Pod count (latest snapshot)")
+    plt.colorbar(im, ax=ax, label="Pod count (average over all snapshots)")
     plt.tight_layout()
     output_path = os.path.join(output_dir, "05_service_placement_by_node.png")
     plt.savefig(output_path, dpi=300, bbox_inches="tight")
@@ -489,7 +492,7 @@ def main():
         f.write("  02_latency_percentiles.png  – Response latency over time (p50/p95/p99)\n")
         f.write("  03_latency_vs_qps.png      – Latency vs load: does higher QPS increase latency?\n")
         f.write("  04_pod_distribution.png    – Scaling: pod count per node over time\n")
-        f.write("  05_service_placement_by_node.png – Placement: which service's pods are on which node\n")
+        f.write("  05_service_placement_by_node.png – Placement: which service's pods are on which node (avg over snapshots)\n")
         f.write("  06_latency_distribution.png – Summary: latency distribution across bursts\n\n")
         f.write("  summary_stats.txt          – Numeric summary\n")
     print(f"✓ Generated: {readme_path}")
