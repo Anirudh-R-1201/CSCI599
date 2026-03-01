@@ -199,26 +199,55 @@ def plot_service_placement(placement, output_dir):
 
 
 def plot_latency_percentiles(bursts, output_dir):
-    """Plot latency percentiles (p50, p95, p99, p99.9) over bursts."""
+    """Plot mean latency percentiles per burst with normalised QPS in background."""
+    from collections import defaultdict
+
+    # Average across endpoints (home/product/cart) sharing the same burst index.
+    by_index = defaultdict(lambda: {"p50": [], "p95": [], "p99": [], "p999": [], "qps": []})
+    for b in bursts:
+        i = b["index"]
+        by_index[i]["p50"].append(b["p50"] * 1000)
+        by_index[i]["p95"].append(b["p95"] * 1000)
+        by_index[i]["p99"].append(b["p99"] * 1000)
+        by_index[i]["p999"].append(b["p999"] * 1000)
+        by_index[i]["qps"].append(b["actual_qps"])
+
+    sorted_indices = sorted(by_index.keys())
+    mean_p50  = [np.mean(by_index[i]["p50"])  for i in sorted_indices]
+    mean_p95  = [np.mean(by_index[i]["p95"])  for i in sorted_indices]
+    mean_p99  = [np.mean(by_index[i]["p99"])  for i in sorted_indices]
+    mean_p999 = [np.mean(by_index[i]["p999"]) for i in sorted_indices]
+    mean_qps  = [np.mean(by_index[i]["qps"])  for i in sorted_indices]
+
+    # Normalise QPS to [0, 1] so it fits as a background fill.
+    max_qps = max(mean_qps) if max(mean_qps) > 0 else 1.0
+    norm_qps = [q / max_qps for q in mean_qps]
+
     fig, ax = plt.subplots(figsize=(14, 6))
-    
-    indices = [b["index"] for b in bursts]
-    p50 = [b["p50"] * 1000 for b in bursts]  # Convert to ms
-    p95 = [b["p95"] * 1000 for b in bursts]
-    p99 = [b["p99"] * 1000 for b in bursts]
-    p999 = [b["p999"] * 1000 for b in bursts]
-    
-    ax.plot(indices, p50, 'o-', label='p50', linewidth=2, markersize=4)
-    ax.plot(indices, p95, 's-', label='p95', linewidth=2, markersize=4)
-    ax.plot(indices, p99, '^-', label='p99', linewidth=2, markersize=4)
-    ax.plot(indices, p999, 'v-', label='p99.9', linewidth=2, markersize=4)
-    
+
+    # Background: normalised QPS bars on a twin y-axis.
+    ax_bg = ax.twinx()
+    ax_bg.bar(sorted_indices, norm_qps, color="grey", alpha=0.18, width=0.8, zorder=1)
+    ax_bg.set_ylim(0, 3.5)   # Push bars to bottom third so they don't obscure lines.
+    ax_bg.set_yticks([0, 0.5, 1.0])
+    ax_bg.set_yticklabels(["0", "0.5×", "peak"], fontsize=9, color="grey")
+    ax_bg.set_ylabel("Normalised QPS (relative to peak)", fontsize=9, color="grey")
+    ax_bg.tick_params(axis="y", colors="grey")
+
+    # Foreground: mean latency lines.
+    ax.plot(sorted_indices, mean_p50,  'o-', label='p50',   linewidth=2, markersize=5, zorder=3)
+    ax.plot(sorted_indices, mean_p95,  's-', label='p95',   linewidth=2, markersize=5, zorder=3)
+    ax.plot(sorted_indices, mean_p99,  '^-', label='p99',   linewidth=2, markersize=5, zorder=3)
+    ax.plot(sorted_indices, mean_p999, 'v-', label='p99.9', linewidth=2, markersize=5, zorder=3)
+
     ax.set_xlabel('Burst index', fontsize=12)
     ax.set_ylabel('Latency (ms)', fontsize=12)
-    ax.set_title('2. Response: latency percentiles over traffic bursts', fontsize=14, fontweight='bold')
-    ax.legend(loc='best', fontsize=10)
-    ax.grid(True, alpha=0.3)
-    
+    ax.set_title('2. Response: mean latency percentiles over traffic bursts', fontsize=14, fontweight='bold')
+    ax.legend(loc='upper right', fontsize=10)
+    ax.grid(True, alpha=0.3, zorder=2)
+    ax.set_zorder(ax_bg.get_zorder() + 1)
+    ax.patch.set_visible(False)  # Let the twin axis background show through.
+
     plt.tight_layout()
     output_path = os.path.join(output_dir, "02_latency_percentiles.png")
     plt.savefig(output_path, dpi=300, bbox_inches='tight')
@@ -227,27 +256,23 @@ def plot_latency_percentiles(bursts, output_dir):
 
 
 def plot_qps_comparison(bursts, output_dir):
-    """Plot requested vs actual QPS per burst."""
+    """Plot actual QPS per burst."""
     fig, ax = plt.subplots(figsize=(14, 6))
-    
+
     indices = [b["index"] for b in bursts]
-    requested = [b["requested_qps"] for b in bursts]
     actual = [b["actual_qps"] for b in bursts]
-    
-    width = 0.35
+
     x = np.arange(len(indices))
-    
-    ax.bar(x - width/2, requested, width, label='Requested QPS', alpha=0.8)
-    ax.bar(x + width/2, actual, width, label='Actual QPS', alpha=0.8)
-    
+
+    ax.bar(x, actual, alpha=0.8, label='Actual QPS')
+
     ax.set_xlabel('Burst index', fontsize=12)
     ax.set_ylabel('Queries per second (QPS)', fontsize=12)
-    ax.set_title('1. Load: requested vs actual QPS per burst', fontsize=14, fontweight='bold')
+    ax.set_title('1. Load: actual QPS per burst', fontsize=14, fontweight='bold')
     ax.set_xticks(x[::2])  # Show every 2nd label to avoid crowding
     ax.set_xticklabels([str(i) for i in indices[::2]])
-    ax.legend(loc='best', fontsize=10)
     ax.grid(True, alpha=0.3, axis='y')
-    
+
     plt.tight_layout()
     output_path = os.path.join(output_dir, "01_qps_comparison.png")
     plt.savefig(output_path, dpi=300, bbox_inches='tight')
@@ -405,6 +430,341 @@ def generate_summary_stats(bursts, snapshots, output_dir):
     print(f"✓ Generated: {output_path}")
 
 
+# ---------------------------------------------------------------------------
+# Data loaders for network-analysis s2s probes
+# ---------------------------------------------------------------------------
+
+def load_s2s_data(data_dir):
+    """Load service-to-service probe records from network-analysis/service-to-service-latency.jsonl."""
+    path = os.path.join(data_dir, "network-analysis", "service-to-service-latency.jsonl")
+    if not os.path.exists(path):
+        return []
+    records = []
+    with open(path) as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                row = json.loads(line)
+            except Exception:
+                continue
+            metrics = {}
+            for token in row.get("probe", "").split():
+                if "=" in token:
+                    k, v = token.split("=", 1)
+                    try:
+                        metrics[k] = float(v) * 1000.0  # s → ms
+                    except ValueError:
+                        try:
+                            metrics[k] = int(v)
+                        except ValueError:
+                            pass
+            records.append({
+                "timestamp": row.get("timestamp", ""),
+                "source_pod": row.get("source_pod", "unknown"),
+                "source_node": row.get("source_node", "unknown"),
+                "target_service": row.get("target_service", "unknown"),
+                **metrics,
+            })
+    return records
+
+
+def load_service_endpoint_nodes(data_dir):
+    """Return {service_name: set(node_names)} aggregated from service-endpoints-*.json."""
+    network_dir = os.path.join(data_dir, "network-analysis")
+    service_to_nodes = defaultdict(set)
+    for path in sorted(glob.glob(os.path.join(network_dir, "service-endpoints-*.json"))):
+        try:
+            with open(path) as f:
+                payload = json.load(f)
+        except Exception:
+            continue
+        for item in payload.get("items", []):
+            svc = (item.get("metadata") or {}).get("name", "unknown")
+            for subset in item.get("subsets", []) or []:
+                for addr in subset.get("addresses", []) or []:
+                    node = addr.get("nodeName")
+                    if node:
+                        service_to_nodes[svc].add(node)
+    return {k: v for k, v in service_to_nodes.items()}
+
+
+def load_latency_vs_replicas(data_dir):
+    """Load network-analysis/latency-vs-replicas.csv; return list of row dicts."""
+    path = os.path.join(data_dir, "network-analysis", "latency-vs-replicas.csv")
+    if not os.path.exists(path):
+        return []
+    rows = []
+    with open(path) as f:
+        header = None
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            if header is None:
+                header = line.split(",")
+                continue
+            rows.append(dict(zip(header, line.split(","))))
+    return rows
+
+
+# ---------------------------------------------------------------------------
+# Graph 07 – cross-node call ratio per service pair
+# ---------------------------------------------------------------------------
+
+def plot_cross_node_ratio(s2s_records, service_to_nodes, output_dir):
+    """Bar chart: % of cross-node calls per (source_app → target_service) pair."""
+    if not s2s_records:
+        print("⚠ No s2s data, skipping cross-node ratio graph")
+        return
+
+    def pod_to_app(pod_name):
+        parts = pod_name.rsplit("-", 2)
+        return parts[0] if len(parts) >= 2 else pod_name
+
+    pair_counts = defaultdict(lambda: {"total": 0, "cross": 0})
+    for rec in s2s_records:
+        source_node = rec.get("source_node", "unknown")
+        target_service = rec.get("target_service", "unknown")
+        source_app = pod_to_app(rec.get("source_pod", "unknown"))
+        pair = f"{source_app}→{target_service}"
+        target_nodes = service_to_nodes.get(target_service, set())
+        pair_counts[pair]["total"] += 1
+        if source_node not in target_nodes:
+            pair_counts[pair]["cross"] += 1
+
+    if not pair_counts:
+        print("⚠ No pair data for cross-node ratio graph")
+        return
+
+    pairs = sorted(pair_counts, key=lambda p: pair_counts[p]["cross"] / max(pair_counts[p]["total"], 1), reverse=True)
+    ratios = [pair_counts[p]["cross"] / max(pair_counts[p]["total"], 1) * 100 for p in pairs]
+    colors = ["#d73027" if r > 50 else "#fc8d59" if r > 25 else "#91bfdb" for r in ratios]
+
+    fig, ax = plt.subplots(figsize=(max(10, len(pairs) * 0.55), 6))
+    ax.bar(range(len(pairs)), ratios, color=colors, alpha=0.88)
+    ax.axhline(50, color="red", linestyle="--", linewidth=1, alpha=0.5, label="50% threshold")
+    ax.set_xticks(range(len(pairs)))
+    ax.set_xticklabels(pairs, rotation=45, ha="right", fontsize=8)
+    ax.set_ylabel("Cross-node calls (%)", fontsize=12)
+    ax.set_ylim(0, 108)
+    ax.set_title("7. Network: cross-node call ratio per service pair", fontsize=14, fontweight="bold")
+    ax.legend(fontsize=10)
+    ax.grid(True, alpha=0.3, axis="y")
+    plt.tight_layout()
+    output_path = os.path.join(output_dir, "07_cross_node_ratio.png")
+    plt.savefig(output_path, dpi=300, bbox_inches="tight")
+    print(f"✓ Generated: {output_path}")
+    plt.close()
+
+
+# ---------------------------------------------------------------------------
+# Graph 08 – same-node vs cross-node latency CDF
+# ---------------------------------------------------------------------------
+
+def plot_same_vs_cross_node_cdf(s2s_records, service_to_nodes, output_dir):
+    """CDF of total latency split into same-node vs cross-node calls."""
+    if not s2s_records:
+        print("⚠ No s2s data, skipping CDF graph")
+        return
+
+    same_node, cross_node = [], []
+    for rec in s2s_records:
+        total = rec.get("total")
+        if total is None:
+            continue
+        source_node = rec.get("source_node", "unknown")
+        target_nodes = service_to_nodes.get(rec.get("target_service", ""), set())
+        if source_node == "unknown" or not target_nodes:
+            continue
+        if source_node in target_nodes:
+            same_node.append(total)
+        else:
+            cross_node.append(total)
+
+    if not same_node and not cross_node:
+        print("⚠ No latency data for CDF graph")
+        return
+
+    fig, ax = plt.subplots(figsize=(10, 6))
+    for latencies, label, color in [
+        (same_node,  f"Same-node  (n={len(same_node)})",  "#2166ac"),
+        (cross_node, f"Cross-node (n={len(cross_node)})", "#d6604d"),
+    ]:
+        if latencies:
+            sv = np.sort(latencies)
+            ax.plot(sv, np.arange(1, len(sv) + 1) / len(sv), linewidth=2.5, label=label, color=color)
+
+    ax.set_xlabel("Total latency (ms)", fontsize=12)
+    ax.set_ylabel("CDF", fontsize=12)
+    ax.set_ylim(0, 1.05)
+    ax.set_title("8. Network penalty: same-node vs cross-node latency CDF", fontsize=14, fontweight="bold")
+    ax.legend(fontsize=11)
+    ax.grid(True, alpha=0.3)
+    plt.tight_layout()
+    output_path = os.path.join(output_dir, "08_same_vs_cross_node_cdf.png")
+    plt.savefig(output_path, dpi=300, bbox_inches="tight")
+    print(f"✓ Generated: {output_path}")
+    plt.close()
+
+
+# ---------------------------------------------------------------------------
+# Graph 09 – p95 latency vs total replica count (scatter)
+# ---------------------------------------------------------------------------
+
+def plot_p95_vs_replicas(latency_replicas_rows, output_dir):
+    """Scatter: s2s p95 latency vs total running replicas, coloured by time order."""
+    if not latency_replicas_rows:
+        print("⚠ No latency-vs-replicas data, skipping p95 vs replicas scatter")
+        return
+
+    total_replicas, p95_vals = [], []
+    for row in latency_replicas_rows:
+        p95_str = row.get("s2s_p95_ms", "")
+        if not p95_str:
+            continue
+        try:
+            p95 = float(p95_str)
+        except ValueError:
+            continue
+        current_total = sum(
+            int(v) for k, v in row.items()
+            if k.endswith("_current") and v and v.isdigit()
+        )
+        if current_total > 0:
+            total_replicas.append(current_total)
+            p95_vals.append(p95)
+
+    if not total_replicas:
+        print("⚠ No data points for p95 vs replicas scatter")
+        return
+
+    fig, ax = plt.subplots(figsize=(10, 6))
+    sc = ax.scatter(total_replicas, p95_vals, c=range(len(total_replicas)),
+                    cmap="plasma", alpha=0.75, s=60, edgecolors="none")
+    plt.colorbar(sc, ax=ax, label="Time (snapshot order → later = brighter)")
+    ax.set_xlabel("Total current replicas (all services)", fontsize=12)
+    ax.set_ylabel("s2s p95 latency (ms)", fontsize=12)
+    ax.set_title("9. Scaling cost: p95 latency vs total running replicas", fontsize=14, fontweight="bold")
+    ax.grid(True, alpha=0.3)
+    plt.tight_layout()
+    output_path = os.path.join(output_dir, "09_p95_vs_replicas.png")
+    plt.savefig(output_path, dpi=300, bbox_inches="tight")
+    print(f"✓ Generated: {output_path}")
+    plt.close()
+
+
+# ---------------------------------------------------------------------------
+# Graph 10 – node-pair p95 latency heatmap
+# ---------------------------------------------------------------------------
+
+def plot_node_pair_heatmap(s2s_records, output_dir):
+    """Heatmap: p95 latency by (source_node × target_service)."""
+    if not s2s_records:
+        print("⚠ No s2s data, skipping node-pair heatmap")
+        return
+
+    def short_node(n):
+        return n.split(".")[0]
+
+    pair_latencies = defaultdict(list)
+    for rec in s2s_records:
+        total = rec.get("total")
+        sn = rec.get("source_node", "unknown")
+        ts = rec.get("target_service", "unknown")
+        if total is not None and sn != "unknown":
+            pair_latencies[(sn, ts)].append(total)
+
+    if not pair_latencies:
+        print("⚠ No data for node-pair heatmap")
+        return
+
+    source_nodes = sorted({k[0] for k in pair_latencies})
+    target_services = sorted({k[1] for k in pair_latencies})
+
+    matrix = np.full((len(source_nodes), len(target_services)), np.nan)
+    for i, sn in enumerate(source_nodes):
+        for j, ts in enumerate(target_services):
+            vals = sorted(pair_latencies.get((sn, ts), []))
+            if vals:
+                matrix[i][j] = vals[min(int(len(vals) * 0.95), len(vals) - 1)]
+
+    fig, ax = plt.subplots(figsize=(max(10, len(target_services) * 0.9), max(4, len(source_nodes) * 0.9)))
+    masked = np.ma.masked_invalid(matrix)
+    im = ax.imshow(masked, cmap="YlOrRd", aspect="auto")
+    plt.colorbar(im, ax=ax, label="p95 latency (ms)")
+
+    ax.set_xticks(range(len(target_services)))
+    ax.set_xticklabels(target_services, rotation=45, ha="right", fontsize=9)
+    ax.set_yticks(range(len(source_nodes)))
+    ax.set_yticklabels([short_node(n) for n in source_nodes], fontsize=9)
+    ax.set_xlabel("Target service", fontsize=12)
+    ax.set_ylabel("Source node", fontsize=12)
+    ax.set_title("10. Topology: p95 latency by source node → target service", fontsize=14, fontweight="bold")
+
+    vmax = np.nanmax(matrix) if not np.all(np.isnan(matrix)) else 1
+    for i in range(len(source_nodes)):
+        for j in range(len(target_services)):
+            v = matrix[i][j]
+            if not np.isnan(v):
+                ax.text(j, i, f"{v:.0f}", ha="center", va="center", fontsize=7,
+                        color="white" if v > vmax * 0.6 else "black")
+
+    plt.tight_layout()
+    output_path = os.path.join(output_dir, "10_node_pair_latency_heatmap.png")
+    plt.savefig(output_path, dpi=300, bbox_inches="tight")
+    print(f"✓ Generated: {output_path}")
+    plt.close()
+
+
+# ---------------------------------------------------------------------------
+# Graph 11 – queueing delay vs network RTT decomposition over time
+# ---------------------------------------------------------------------------
+
+def plot_queueing_vs_rtt(s2s_records, output_dir):
+    """Stacked area: mean network RTT (connect) vs queueing (ttfb − connect) per snapshot."""
+    if not s2s_records:
+        print("⚠ No s2s data, skipping queueing vs RTT graph")
+        return
+
+    by_ts = defaultdict(lambda: {"connect": [], "queueing": []})
+    for rec in s2s_records:
+        connect = rec.get("connect")
+        ttfb = rec.get("ttfb")
+        ts = rec.get("timestamp", "")
+        if connect is not None and ttfb is not None and connect >= 0:
+            q = ttfb - connect
+            if q >= 0:
+                by_ts[ts]["connect"].append(connect)
+                by_ts[ts]["queueing"].append(q)
+
+    if not by_ts:
+        print("⚠ No connect/ttfb data for queueing vs RTT graph")
+        return
+
+    sorted_ts = sorted(by_ts)
+    mean_connect = [np.mean(by_ts[ts]["connect"]) for ts in sorted_ts]
+    mean_queueing = [np.mean(by_ts[ts]["queueing"]) for ts in sorted_ts]
+    x = range(len(sorted_ts))
+
+    fig, ax = plt.subplots(figsize=(14, 6))
+    ax.stackplot(x, mean_connect, mean_queueing,
+                 labels=["Network RTT (connect)", "Queueing delay (ttfb − connect)"],
+                 colors=["#4393c3", "#d6604d"], alpha=0.85)
+    ax.set_xlabel("Probe snapshot (time order)", fontsize=12)
+    ax.set_ylabel("Latency (ms)", fontsize=12)
+    ax.set_title("11. Decomposition: network RTT vs server queueing delay over time",
+                 fontsize=14, fontweight="bold")
+    ax.legend(loc="upper left", fontsize=10)
+    ax.grid(True, alpha=0.3, axis="y")
+    plt.tight_layout()
+    output_path = os.path.join(output_dir, "11_queueing_vs_rtt.png")
+    plt.savefig(output_path, dpi=300, bbox_inches="tight")
+    print(f"✓ Generated: {output_path}")
+    plt.close()
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Generate visualization graphs from baseline test data"
@@ -471,8 +831,8 @@ def main():
     else:
         print("  No pod placement data found")
     
-    # Generate graphs in story order (view 01–06 in order to understand the experiment)
-    print("\nGenerating graphs (story order: load → response → scaling → placement → summary)...")
+    # Generate graphs in story order (view 01–11 in order to understand the experiment)
+    print("\nGenerating graphs (story order: load → response → scaling → placement → network)...")
     plot_qps_comparison(bursts, output_dir)
     plot_latency_percentiles(bursts, output_dir)
     plot_latency_vs_qps(bursts, output_dir)
@@ -484,17 +844,38 @@ def main():
     plot_latency_distribution(bursts, output_dir)
     generate_summary_stats(bursts, snapshots, output_dir)
 
+    print("\nLoading network-analysis data for graphs 07–11...")
+    s2s_records = load_s2s_data(data_dir)
+    service_to_nodes = load_service_endpoint_nodes(data_dir)
+    latency_replicas_rows = load_latency_vs_replicas(data_dir)
+    if s2s_records:
+        print(f"  Loaded {len(s2s_records)} s2s probe records")
+    else:
+        print("  No s2s probe data found (graphs 07–11 may be skipped)")
+
+    plot_cross_node_ratio(s2s_records, service_to_nodes, output_dir)
+    plot_same_vs_cross_node_cdf(s2s_records, service_to_nodes, output_dir)
+    plot_p95_vs_replicas(latency_replicas_rows, output_dir)
+    plot_node_pair_heatmap(s2s_records, output_dir)
+    plot_queueing_vs_rtt(s2s_records, output_dir)
+
     # Write a short README so viewers know the order
     readme_path = os.path.join(output_dir, "README.txt")
     with open(readme_path, "w") as f:
         f.write("Experiment graphs – view in order to follow the story:\n\n")
-        f.write("  01_qps_comparison.png       – Load applied (requested vs actual QPS per burst)\n")
-        f.write("  02_latency_percentiles.png  – Response latency over time (p50/p95/p99)\n")
-        f.write("  03_latency_vs_qps.png      – Latency vs load: does higher QPS increase latency?\n")
-        f.write("  04_pod_distribution.png    – Scaling: pod count per node over time\n")
-        f.write("  05_service_placement_by_node.png – Placement: which service's pods are on which node (avg over snapshots)\n")
-        f.write("  06_latency_distribution.png – Summary: latency distribution across bursts\n\n")
-        f.write("  summary_stats.txt          – Numeric summary\n")
+        f.write("  01_qps_comparison.png            – Load applied (actual QPS per burst)\n")
+        f.write("  02_latency_percentiles.png        – Mean latency percentiles over bursts (+ normalised QPS bg)\n")
+        f.write("  03_latency_vs_qps.png             – Latency vs load: does higher QPS increase latency?\n")
+        f.write("  04_pod_distribution.png           – Scaling: pod count per node over time\n")
+        f.write("  05_service_placement_by_node.png  – Placement: which service's pods are on which node\n")
+        f.write("  06_latency_distribution.png       – Summary: latency distribution across bursts\n\n")
+        f.write("  Network-inefficiency graphs (require s2s probe data):\n")
+        f.write("  07_cross_node_ratio.png           – % of calls that crossed a node boundary per service pair\n")
+        f.write("  08_same_vs_cross_node_cdf.png     – Latency CDF: same-node vs cross-node calls\n")
+        f.write("  09_p95_vs_replicas.png            – p95 latency vs total running replicas (HPA scaling cost)\n")
+        f.write("  10_node_pair_latency_heatmap.png  – p95 latency heatmap: source node × target service\n")
+        f.write("  11_queueing_vs_rtt.png            – Decomposition: network RTT vs server queueing delay\n\n")
+        f.write("  summary_stats.txt                 – Numeric summary\n")
     print(f"✓ Generated: {readme_path}")
 
     print(f"\n✓ All graphs generated in: {output_dir}")
