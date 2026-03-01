@@ -77,39 +77,37 @@ capture_cluster_snapshot() {
 probe_service_latencies() {
   local timestamp="$1"
   local targets="$2"
-  local sources
-  sources=$(kubectl --kubeconfig "${KUBECONFIG_PATH}" get pods -n default \
-    -l "app in (frontend,productcatalogservice,recommendationservice,cartservice,checkoutservice)" \
-    -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}' 2>/dev/null || true)
 
-  if [ -z "${sources}" ]; then
+  # Microservice pods use distroless images (no shell/curl). Instead, run all
+  # probes from fortio-loadgen which is a full image with curl available.
+  local source_pod="fortio-loadgen"
+  local source_node
+  source_node=$(kubectl --kubeconfig "${KUBECONFIG_PATH}" get pod "${source_pod}" \
+    -o jsonpath='{.spec.nodeName}' 2>/dev/null || echo "unknown")
+
+  if [ -z "${source_node}" ] || [ "${source_node}" = "unknown" ]; then
+    echo "⚠ probe_service_latencies: fortio-loadgen pod not found or node unknown, skipping" >&2
     return
   fi
 
-  while IFS= read -r source_pod; do
-    [ -z "${source_pod}" ] && continue
-    local source_node
-    source_node=$(kubectl --kubeconfig "${KUBECONFIG_PATH}" get pod "${source_pod}" -n default -o jsonpath='{.spec.nodeName}' 2>/dev/null || echo "unknown")
+  IFS=',' read -ra target_array <<< "${targets}"
+  for target in "${target_array[@]}"; do
+    local t
+    t="$(echo "${target}" | xargs)"
+    [ -z "${t}" ] && continue
+    for ((k=0; k<S2S_PROBE_REPEAT; k++)); do
+      local probe
+      probe=$(kubectl --kubeconfig "${KUBECONFIG_PATH}" exec "${source_pod}" -- \
+        curl -sS -o /dev/null \
+          -w 'dns=%{time_namelookup} connect=%{time_connect} ttfb=%{time_starttransfer} total=%{time_total} code=%{http_code}' \
+          --max-time 5 "http://${t}:80/" 2>/dev/null || true)
 
-    IFS=',' read -ra target_array <<< "${targets}"
-    for target in "${target_array[@]}"; do
-      local t
-      t="$(echo "${target}" | xargs)"
-      [ -z "${t}" ] && continue
-      for ((k=0; k<S2S_PROBE_REPEAT; k++)); do
-        local probe
-        probe=$(kubectl --kubeconfig "${KUBECONFIG_PATH}" exec -n default "${source_pod}" -- \
-          sh -c "curl -sS -o /dev/null \
-            -w 'dns=%{time_namelookup} connect=%{time_connect} ttfb=%{time_starttransfer} total=%{time_total} code=%{http_code}' \
-            --max-time 5 http://${t}:80/" 2>/dev/null || true)
-
-        if [ -n "${probe}" ]; then
-          printf '{"timestamp":"%s","source_pod":"%s","source_node":"%s","target_service":"%s","probe":"%s"}\n' \
-            "${timestamp}" "${source_pod}" "${source_node}" "${t}" "${probe}" >> "${S2S_FILE}"
-        fi
-      done
+      if [ -n "${probe}" ]; then
+        printf '{"timestamp":"%s","source_pod":"%s","source_node":"%s","target_service":"%s","probe":"%s"}\n' \
+          "${timestamp}" "${source_pod}" "${source_node}" "${t}" "${probe}" >> "${S2S_FILE}"
+      fi
     done
-  done <<< "${sources}"
+  done
 }
 
 monitor_loop() {
