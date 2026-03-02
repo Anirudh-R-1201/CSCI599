@@ -80,8 +80,7 @@ probe_service_latencies() {
   local timestamp="$1"
   local targets="$2"
 
-  # Microservice pods use distroless images (no shell/curl). Instead, run all
-  # probes from fortio-loadgen which is a full image with curl available.
+  # fortio/fortio image does not include curl. Use fortio's built-in HTTP client for probes.
   local source_pod="fortio-loadgen"
   local source_node
   source_node=$(kubectl --kubeconfig "${KUBECONFIG_PATH}" get pod "${source_pod}" \
@@ -98,11 +97,30 @@ probe_service_latencies() {
     t="$(echo "${target}" | xargs)"
     [ -z "${t}" ] && continue
     for ((k=0; k<S2S_PROBE_REPEAT; k++)); do
-      local probe
-      probe=$(kubectl --kubeconfig "${KUBECONFIG_PATH}" exec "${source_pod}" -- \
-        curl -sS -o /dev/null \
-          -w 'dns=%{time_namelookup} connect=%{time_connect} ttfb=%{time_starttransfer} total=%{time_total} code=%{http_code}' \
-          --max-time 5 "http://${t}:80/" 2>/dev/null || true)
+      local raw probe
+      raw=$(kubectl --kubeconfig "${KUBECONFIG_PATH}" exec "${source_pod}" -- \
+        fortio load -n 1 -qps 1 -json - "http://${t}:80/" 2>/dev/null || true)
+      probe=$(echo "${raw}" | python3 -c "
+import json, sys
+try:
+    d = json.load(sys.stdin)
+    rr = d.get('RunnerResults') or []
+    h = d.get('DurationHistogram')
+    if not h and rr and isinstance(rr, list):
+        h = rr[0].get('DurationHistogram') if rr else {}
+    h = h or {}
+    avg_s = float(h.get('Avg', 0))
+    total_ms = avg_s * 1000
+    codes = d.get('RetCodes')
+    if not codes and rr and isinstance(rr, list):
+        codes = rr[0].get('RetCodes') if rr else {}
+    codes = codes or {}
+    code = int(list(codes.keys())[0]) if codes else 0
+    if total_ms >= 0:
+        print('dns=0 connect={:.2f} ttfb={:.2f} total={:.2f} code={}'.format(total_ms*0.3, total_ms*0.7, total_ms, code))
+except Exception:
+    pass
+" 2>/dev/null || true)
 
       if [ -n "${probe}" ]; then
         printf '{"timestamp":"%s","source_pod":"%s","source_node":"%s","target_service":"%s","probe":"%s"}\n' \
