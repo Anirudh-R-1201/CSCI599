@@ -15,13 +15,15 @@ NET_DIR="${DATA_DIR_BASE}/network-analysis"
 mkdir -p "${LOAD_DIR}" "${NET_DIR}"
 
 # Traffic settings.
+# Longer inter-burst gaps (MIN/MAX_SLEEP) give time for HPA to scale down between bursts.
 BURSTS="${BURSTS:-18}"
-BASE_BURST_SECONDS="${BASE_BURST_SECONDS:-90}"
-MAX_BURST_SECONDS="${MAX_BURST_SECONDS:-180}"
-MAX_SLEEP_SECONDS="${MAX_SLEEP_SECONDS:-5}"
-THREADS_PER_ENDPOINT="${THREADS_PER_ENDPOINT:-48}"
-QPS_FLOOR="${QPS_FLOOR:-600}"
-QPS_CEIL="${QPS_CEIL:-6000}"
+BASE_BURST_SECONDS="${BASE_BURST_SECONDS:-45}"
+MAX_BURST_SECONDS="${MAX_BURST_SECONDS:-90}"
+MIN_SLEEP_SECONDS="${MIN_SLEEP_SECONDS:-45}"
+MAX_SLEEP_SECONDS="${MAX_SLEEP_SECONDS:-120}"
+THREADS_PER_ENDPOINT="${THREADS_PER_ENDPOINT:-12}"
+QPS_FLOOR="${QPS_FLOOR:-80}"
+QPS_CEIL="${QPS_CEIL:-500}"
 SPIKE_PROBABILITY="${SPIKE_PROBABILITY:-0.35}"
 
 # Relative endpoint weights for generated total QPS.
@@ -30,7 +32,7 @@ WEIGHT_PRODUCT="${WEIGHT_PRODUCT:-0.35}"
 WEIGHT_CART="${WEIGHT_CART:-0.20}"
 
 # Export so inline Python (burst plan) can read them
-export BURSTS BASE_BURST_SECONDS MAX_BURST_SECONDS MAX_SLEEP_SECONDS
+export BURSTS BASE_BURST_SECONDS MAX_BURST_SECONDS MIN_SLEEP_SECONDS MAX_SLEEP_SECONDS
 export QPS_FLOOR QPS_CEIL SPIKE_PROBABILITY
 export WEIGHT_HOME WEIGHT_PRODUCT WEIGHT_CART
 
@@ -135,6 +137,7 @@ import time
 bursts = int(os.environ["BURSTS"])
 min_dur = int(os.environ["BASE_BURST_SECONDS"])
 max_dur = int(os.environ["MAX_BURST_SECONDS"])
+min_sleep = int(os.environ.get("MIN_SLEEP_SECONDS", "2"))
 max_sleep = int(os.environ["MAX_SLEEP_SECONDS"])
 qps_floor = int(os.environ["QPS_FLOOR"])
 qps_ceil = int(os.environ["QPS_CEIL"])
@@ -158,7 +161,7 @@ for i in range(bursts):
         burst_type = "heavy_tail"
 
     duration = random.randint(min_dur, max_dur)
-    sleep_s = random.randint(2, max_sleep)
+    sleep_s = random.randint(min_sleep, max_sleep)
 
     q_home = max(1, int(total_qps * (w_home / total_weight)))
     q_prod = max(1, int(total_qps * (w_prod / total_weight)))

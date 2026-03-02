@@ -396,14 +396,30 @@ def load_hpa_snapshots(network_dir: Path) -> List[Tuple[str, dict]]:
     return out
 
 
+def get_ts_to_node_count(pod_snapshots: List[dict]) -> Dict[str, int]:
+    """From pod snapshots, return timestamp -> number of distinct nodes with at least one pod."""
+    out: Dict[str, int] = {}
+    for snap in pod_snapshots:
+        ts = snap.get("timestamp", "")
+        nodes: Set[str] = set()
+        for pod in snap.get("items", []):
+            node = (pod.get("spec") or {}).get("nodeName")
+            if node and node != "unknown":
+                nodes.add(node)
+        out[ts] = len(nodes)
+    return out
+
+
 def build_latency_vs_replicas(
     network_dir: Path,
     hpa_snapshots: List[Tuple[str, dict]],
+    ts_to_node_count: Optional[Dict[str, int]] = None,
 ) -> Optional[Path]:
     """Build latency-vs-replicas.csv from HPA snapshots and s2s probes grouped by timestamp."""
     p = network_dir / "service-to-service-latency.jsonl"
     if not p.exists() or not hpa_snapshots:
         return None
+    ts_to_node_count = ts_to_node_count or {}
 
     # Group s2s probes by timestamp -> list of total ms
     by_ts: Dict[str, List[float]] = defaultdict(list)
@@ -442,6 +458,7 @@ def build_latency_vs_replicas(
             row[f"{name}_current"] = info.get("current", "")
         row["s2s_p95_ms"] = f"{s2s_p95:.2f}" if s2s_p95 is not None else ""
         row["s2s_p99_ms"] = f"{s2s_p99:.2f}" if s2s_p99 is not None else ""
+        row["node_count"] = str(ts_to_node_count.get(ts, ""))
         rows.append(row)
 
     # Also include timestamps that have s2s but no HPA (e.g. partial overlap)
@@ -456,10 +473,11 @@ def build_latency_vs_replicas(
             row[f"{n}_current"] = ""
         row["s2s_p95_ms"] = f"{percentile(totals_at_ts, 95):.2f}" if totals_at_ts else ""
         row["s2s_p99_ms"] = f"{percentile(totals_at_ts, 99):.2f}" if totals_at_ts else ""
+        row["node_count"] = str(ts_to_node_count.get(ts, ""))
         rows.append(row)
     rows.sort(key=lambda r: r["timestamp"])
 
-    header = ["timestamp"] + [f"{n}_desired" for n in all_hpa_names] + [f"{n}_current" for n in all_hpa_names] + ["s2s_p95_ms", "s2s_p99_ms"]
+    header = ["timestamp"] + [f"{n}_desired" for n in all_hpa_names] + [f"{n}_current" for n in all_hpa_names] + ["s2s_p95_ms", "s2s_p99_ms", "node_count"]
     with open(csv_path, "w") as f:
         f.write(",".join(header) + "\n")
         for row in rows:
@@ -472,6 +490,7 @@ def write_text_report(
     placement: dict,
     e2e: dict,
     s2s: dict,
+    spread_stats: Optional[dict] = None,
 ) -> None:
     lines = []
     lines.append("Network Analysis Summary")
@@ -577,7 +596,78 @@ def write_text_report(
     else:
         lines.append("  No node-pair aggregation (need s2s probes with source_node).")
 
+    # 6) Pod spread on fixed nodes (no node scaling)
+    if spread_stats:
+        lines.append("6) Pod spread across fixed nodes (no node scaling)")
+        lines.append("-" * 80)
+        lines.append("  node_count = number of nodes that have ≥1 workload pod (cluster size is fixed).")
+        dist = spread_stats.get("node_count_distribution", {})
+        if dist:
+            lines.append(f"  node_count range: {spread_stats.get('node_count_min', '')} – {spread_stats.get('node_count_max', '')}")
+            lines.append("  Distribution (snapshots): " + ", ".join(f"{k} nodes ({v})" for k, v in sorted(dist.items())))
+        corr = spread_stats.get("node_count_p95_correlation")
+        if corr is not None:
+            lines.append(f"  Correlation(node_count, s2s_p95_ms): {corr:.3f}")
+            if corr > 0.3:
+                lines.append("  → Higher spread across nodes tends to increase latency (cross-node cost).")
+            elif corr < -0.2:
+                lines.append("  → More spread here associated with lower latency (e.g. less contention).")
+        lines.append("")
+
     (network_dir / "analysis-summary.txt").write_text("\n".join(lines) + "\n")
+
+
+def compute_spread_correlation(csv_path: Path) -> Optional[dict]:
+    """Read latency-vs-replicas.csv and compute node_count vs s2s_p95 correlation and distribution.
+    Relevant when nodes are fixed: measures how pod spread across those nodes relates to latency."""
+    if not csv_path.exists():
+        return None
+    rows: List[dict] = []
+    with open(csv_path) as f:
+        header = [h.strip() for h in f.readline().strip().split(",")]
+        for line in f:
+            values = line.strip().split(",")
+            if len(values) >= len(header):
+                rows.append(dict(zip(header, values)))
+    node_counts: List[float] = []
+    p95_vals: List[float] = []
+    dist: Dict[int, int] = defaultdict(int)
+    for row in rows:
+        nc_str = (row.get("node_count") or "").strip()
+        p95_str = (row.get("s2s_p95_ms") or "").strip()
+        if not nc_str or not p95_str:
+            continue
+        try:
+            nc = int(nc_str)
+            p95 = float(p95_str)
+        except ValueError:
+            continue
+        if nc > 0:
+            node_counts.append(nc)
+            p95_vals.append(p95)
+            dist[nc] += 1
+    if len(node_counts) < 2:
+        return {"node_count_distribution": dict(dist), "node_count_min": min(dist.keys()) if dist else None, "node_count_max": max(dist.keys()) if dist else None}
+    try:
+        corr = statistics.correlation(node_counts, p95_vals)
+    except AttributeError:
+        # Python < 3.10: compute Pearson correlation manually
+        n = len(node_counts)
+        mx, my = statistics.mean(node_counts), statistics.mean(p95_vals)
+        sx = math.sqrt(sum((x - mx) ** 2 for x in node_counts) / n) if n else 0
+        sy = math.sqrt(sum((y - my) ** 2 for y in p95_vals) / n) if n else 0
+        if sx and sy:
+            corr = sum((node_counts[i] - mx) * (p95_vals[i] - my) for i in range(n)) / (n * sx * sy)
+        else:
+            corr = None
+    except Exception:
+        corr = None
+    return {
+        "node_count_p95_correlation": corr,
+        "node_count_distribution": dict(dist),
+        "node_count_min": min(dist.keys()) if dist else None,
+        "node_count_max": max(dist.keys()) if dist else None,
+    }
 
 
 def write_recommendations(network_dir: Path, placement: dict, e2e: dict, s2s: dict) -> None:
@@ -603,6 +693,14 @@ def write_recommendations(network_dir: Path, placement: dict, e2e: dict, s2s: di
     lines.append("5. **Replica locality efficiency score**")
     lines.append("   - Why: single objective metric for scheduler experiments.")
     lines.append("   - How: weighted score using intra-node ratio, p95 total latency, and error rate.")
+    lines.append("")
+    lines.append("## Fixed-node experiments (no node scaling)")
+    lines.append("")
+    lines.append("When the cluster has a **fixed set of nodes**, the metrics that matter most are:")
+    lines.append("- **Same-node vs cross-node latency** (graphs 07, 08): how much worse is latency when caller and callee are on different nodes.")
+    lines.append("- **Pod spread vs latency** (graph 09b, section 6 of analysis-summary): correlation between how many nodes have pods and s2s p95.")
+    lines.append("- **Queueing vs network RTT** (graph 11, section 4): separates overlay/network cost from app queueing.")
+    lines.append("- **Tail latency by (source_node, target_service)** (section 5, graph 10): which node pairs see the highest latency.")
     lines.append("")
     lines.append("## Current Run Quick Facts")
     lines.append("")
@@ -675,11 +773,13 @@ def main() -> None:
     write_json(network_dir / "node-pair-latency-summary.json", {
         "by_source_node_target_service": s2s.get("node_pair_summary", {}),
     })
-    write_text_report(network_dir, placement, e2e, s2s)
-    write_recommendations(network_dir, placement, e2e, s2s)
 
     hpa_snapshots = load_hpa_snapshots(network_dir)
-    latency_vs_replicas_path = build_latency_vs_replicas(network_dir, hpa_snapshots)
+    ts_to_node_count = get_ts_to_node_count(pod_snapshots)
+    latency_vs_replicas_path = build_latency_vs_replicas(network_dir, hpa_snapshots, ts_to_node_count)
+    spread_stats = compute_spread_correlation(latency_vs_replicas_path) if latency_vs_replicas_path else None
+    write_text_report(network_dir, placement, e2e, s2s, spread_stats)
+    write_recommendations(network_dir, placement, e2e, s2s)
 
     print("=" * 72)
     print("Analysis complete")

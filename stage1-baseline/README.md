@@ -39,19 +39,31 @@ Useful variables:
 
 - `CPU_THRESHOLD` (default `75`) – HPA CPU target %; use 50 for more aggressive scaling
 - `BURSTS` (default `18`)
-- `BASE_BURST_SECONDS` (default `90`), `MAX_BURST_SECONDS` (default `180`) – long bursts so HPA sees sustained high CPU
-- `MAX_SLEEP_SECONDS` (default `5`)
-- `QPS_FLOOR` (default `600`)
-- `QPS_CEIL` (default `6000`)
-- `THREADS_PER_ENDPOINT` (default `48`)
+- `BASE_BURST_SECONDS` (default `45`), `MAX_BURST_SECONDS` (default `90`) – burst length so HPA can scale up
+- `MIN_SLEEP_SECONDS` (default `45`), `MAX_SLEEP_SECONDS` (default `120`) – **time between bursts** so replicas can scale down; longer gaps make scale-up/scale-down and cross-node latency effects more visible
+- `QPS_FLOOR` (default `80`), `QPS_CEIL` (default `500`) – load range; lower ceiling keeps latency readable and highlights networking cost when pods are spread across nodes
+- `THREADS_PER_ENDPOINT` (default `12`)
 - `SAMPLE_INTERVAL` (default `8`)
 
 Example:
 
 ```bash
-MODE=full BURSTS=24 QPS_CEIL=8000 ./01-run-experiment.sh
-# If replicas still don't reach 7–8: CPU_THRESHOLD=40
+MODE=full ./01-run-experiment.sh
+# Higher load / more bursts: BURSTS=24 QPS_CEIL=800 ./01-run-experiment.sh
+# If replicas don't scale: CPU_THRESHOLD=50
 ```
+
+## Fixed-node experiments (no node scaling)
+
+The cluster has a **fixed set of nodes**; only **pods** scale (HPA). `node_count` in the analysis means *how many of those nodes have ≥1 workload pod* (pod spread), not cluster size.
+
+**Metrics that matter:**
+- **Same-node vs cross-node latency** (graphs 07, 08): latency when caller and callee share a node vs different nodes.
+- **Pod spread vs latency** (graph 09b, section 6 of `analysis-summary.txt`): correlation between `node_count` and s2s p95; higher spread often means more cross-node traffic and higher latency.
+- **Queueing vs network RTT** (graph 11): separates overlay/network cost from app queueing.
+- **Tail latency by (source_node, target_service)** (graph 10, section 5): which node pairs see the worst latency.
+
+See `experiment-metrics-recommendations.md` for the same list and quick facts.
 
 ## Analysis
 
@@ -69,9 +81,9 @@ Primary outputs:
 - `network-analysis/e2e-latency-summary.json`
 - `network-analysis/service-to-service-latency-summary.json`
 - `network-analysis/node-pair-latency-summary.json` (p95/p99 by source_node → target_service)
-- `network-analysis/latency-vs-replicas.csv` (HPA desired/current vs s2s p95/p99 per timestamp)
+- `network-analysis/latency-vs-replicas.csv` (HPA desired/current, s2s p95/p99, and **node_count** per timestamp)
 - `network-analysis/experiment-metrics-recommendations.md`
-- `graphs/*.png` (if matplotlib available): 01–06 in story order (load → response → latency vs QPS → scaling → **service placement** → summary); see `graphs/README.txt`
+- `graphs/*.png` (if matplotlib available): 01–06 in story order; 07–11 for network (cross-node ratio, same vs cross-node CDF, **09b p95 vs node count** for cross-node latency cost); see `graphs/README.txt`
 
 ## Data Layout
 

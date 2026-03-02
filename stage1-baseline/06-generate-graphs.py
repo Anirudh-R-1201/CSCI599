@@ -656,6 +656,46 @@ def plot_p95_vs_replicas(latency_replicas_rows, output_dir):
 
 
 # ---------------------------------------------------------------------------
+# Graph 09b – p95 latency vs node count (cross-node spread → higher latency)
+# ---------------------------------------------------------------------------
+
+def plot_p95_vs_node_count(latency_replicas_rows, output_dir):
+    """Scatter: s2s p95 latency vs number of nodes with pods (shows cross-node latency cost)."""
+    node_counts, p95_vals = [], []
+    for row in latency_replicas_rows:
+        nc_str = row.get("node_count", "").strip()
+        p95_str = row.get("s2s_p95_ms", "").strip()
+        if not nc_str or not p95_str:
+            continue
+        try:
+            nc = int(nc_str)
+            p95 = float(p95_str)
+        except ValueError:
+            continue
+        if nc > 0:
+            node_counts.append(nc)
+            p95_vals.append(p95)
+
+    if not node_counts:
+        print("⚠ No node_count data in latency-vs-replicas, skipping p95 vs node count graph")
+        return
+
+    fig, ax = plt.subplots(figsize=(10, 6))
+    sc = ax.scatter(node_counts, p95_vals, c=range(len(node_counts)),
+                    cmap="viridis", alpha=0.75, s=60, edgecolors="none")
+    plt.colorbar(sc, ax=ax, label="Time (snapshot order → later = brighter)")
+    ax.set_xlabel("Number of nodes with workload pods", fontsize=12)
+    ax.set_ylabel("s2s p95 latency (ms)", fontsize=12)
+    ax.set_title("9b. Cross-node cost: p95 latency vs pod spread across nodes", fontsize=14, fontweight="bold")
+    ax.grid(True, alpha=0.3)
+    plt.tight_layout()
+    output_path = os.path.join(output_dir, "09b_p95_vs_node_count.png")
+    plt.savefig(output_path, dpi=300, bbox_inches="tight")
+    print(f"✓ Generated: {output_path}")
+    plt.close()
+
+
+# ---------------------------------------------------------------------------
 # Graph 10 – node-pair p95 latency heatmap
 # ---------------------------------------------------------------------------
 
@@ -856,6 +896,7 @@ def main():
     plot_cross_node_ratio(s2s_records, service_to_nodes, output_dir)
     plot_same_vs_cross_node_cdf(s2s_records, service_to_nodes, output_dir)
     plot_p95_vs_replicas(latency_replicas_rows, output_dir)
+    plot_p95_vs_node_count(latency_replicas_rows, output_dir)
     plot_node_pair_heatmap(s2s_records, output_dir)
     plot_queueing_vs_rtt(s2s_records, output_dir)
 
@@ -873,6 +914,7 @@ def main():
         f.write("  07_cross_node_ratio.png           – % of calls that crossed a node boundary per service pair\n")
         f.write("  08_same_vs_cross_node_cdf.png     – Latency CDF: same-node vs cross-node calls\n")
         f.write("  09_p95_vs_replicas.png            – p95 latency vs total running replicas (HPA scaling cost)\n")
+        f.write("  09b_p95_vs_node_count.png        – p95 latency vs nodes with pods (cross-node latency cost)\n")
         f.write("  10_node_pair_latency_heatmap.png  – p95 latency heatmap: source node × target service\n")
         f.write("  11_queueing_vs_rtt.png            – Decomposition: network RTT vs server queueing delay\n\n")
         f.write("  summary_stats.txt                 – Numeric summary\n")

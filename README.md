@@ -202,7 +202,7 @@ go version
 
 # Install jinjanator (for manifest generation)
 sudo apt install python3-pip
-pip3 install --user jinjanator
+pip3 install --user jinjanator matplotlib
 export PATH="$HOME/.local/bin:$PATH"
 echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.profile
 ```
