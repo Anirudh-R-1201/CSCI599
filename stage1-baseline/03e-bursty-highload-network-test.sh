@@ -89,7 +89,7 @@ probe_service_latencies() {
 
   if [ -z "${source_node}" ] || [ "${source_node}" = "unknown" ]; then
     echo "⚠ probe_service_latencies: fortio-loadgen pod not found or node unknown, skipping" >&2
-    return
+    return 0
   fi
 
   IFS=',' read -ra target_array <<< "${targets}"
@@ -116,14 +116,16 @@ monitor_loop() {
   while [ ! -f "${NET_DIR}/.monitor-stop" ]; do
     local ts
     ts="$(date +"%Y%m%d-%H%M%S")"
-    capture_cluster_snapshot "${ts}"
-    probe_service_latencies "${ts}" "${TARGET_SERVICES_CSV}"
+    ( set +e; capture_cluster_snapshot "${ts}"; probe_service_latencies "${ts}" "${TARGET_SERVICES_CSV}"; )
     sleep "${SAMPLE_INTERVAL}"
   done
 }
 
 : > "${S2S_FILE}"
 echo "Starting telemetry monitoring in background (interval=${SAMPLE_INTERVAL}s)..."
+# One initial probe so we verify connectivity and have at least one sample if the loop fails
+ts0="$(date +"%Y%m%d-%H%M%S")"
+( set +e; probe_service_latencies "${ts0}" "${TARGET_SERVICES_CSV}"; )
 monitor_loop > "${NET_DIR}/monitoring.log" 2>&1 &
 MONITOR_PID=$!
 
@@ -231,6 +233,17 @@ done < "${META_FILE}"
 touch "${NET_DIR}/.monitor-stop"
 wait "${MONITOR_PID}" || true
 rm -f "${NET_DIR}/.monitor-stop"
+
+# Warn if no s2s data (graphs 07-11 need this)
+s2s_lines=$(wc -l < "${S2S_FILE}" 2>/dev/null || echo "0")
+if [ "${s2s_lines}" -eq 0 ]; then
+  echo ""
+  echo "⚠ WARNING: service-to-service-latency.jsonl is empty. Graphs 07-11 will not be generated."
+  echo "  Check: kubectl get pod fortio-loadgen"
+  echo "  Test:  kubectl exec fortio-loadgen -- curl -s -o /dev/null -w '%{http_code}' http://frontend:80/"
+  echo "  Log:   ${NET_DIR}/monitoring.log"
+  echo ""
+fi
 
 kubectl --kubeconfig "${KUBECONFIG_PATH}" get hpa -o wide > "${NET_DIR}/hpa-after.txt" || true
 kubectl --kubeconfig "${KUBECONFIG_PATH}" get events -n default --sort-by='.lastTimestamp' > "${NET_DIR}/events-scaling.txt" || true

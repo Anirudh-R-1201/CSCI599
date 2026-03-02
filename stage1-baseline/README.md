@@ -85,23 +85,6 @@ Primary outputs:
 - `network-analysis/experiment-metrics-recommendations.md`
 - `graphs/*.png`: 01–06 (load, latency, scaling, placement); 07–11 (cross-node ratio, same vs cross-node CDF, p95 vs replicas/node count, heatmap, queueing vs RTT). See `graphs/README.txt`.
 
-## Why only 6 graphs? (07–11 missing)
-
-Graphs **07–11** need extra data that not every run has:
-
-| Graphs | Required file | Who creates it |
-|--------|----------------|-----------------|
-| 07, 08, 10, 11 | `network-analysis/service-to-service-latency.jsonl` | **03e** during the traffic run (monitoring loop probes each service) |
-| 09, 09b | `network-analysis/latency-vs-replicas.csv` | **07-analyze-network-data.py** (needs the .jsonl above + HPA snapshots) |
-
-If **service-to-service-latency.jsonl** is missing or empty you get only 01–06. Common causes:
-
-- The **traffic phase** (03e) didn’t run or exited before writing probes (e.g. `MODE=prep` only, or 03e failed).
-- The run directory was **copied** from CloudLab and the `.jsonl` file was not included (it can be large).
-- **Analysis** was run on a different machine/dir that never had the `.jsonl`.
-
-**Fix:** Run a full experiment from the same directory and then analyze there: `MODE=full ./01-run-experiment.sh` then `./02-analyze-results.sh`. Do not move or prune the run directory before running analysis so `network-analysis/service-to-service-latency.jsonl` is present.
-
 ## Data Layout
 
 ```text
