@@ -885,6 +885,8 @@ def main():
     generate_summary_stats(bursts, snapshots, output_dir)
 
     print("\nGenerating network graphs 07–11 (always attempted)...")
+    s2s_path = os.path.join(data_dir, "network-analysis", "service-to-service-latency.jsonl")
+    csv_path = os.path.join(data_dir, "network-analysis", "latency-vs-replicas.csv")
     s2s_records = load_s2s_data(data_dir)
     service_to_nodes = load_service_endpoint_nodes(data_dir)
     latency_replicas_rows = load_latency_vs_replicas(data_dir)
@@ -892,10 +894,16 @@ def main():
         print(f"  Loaded {len(s2s_records)} s2s probe records")
     else:
         print("  No s2s probe data (07, 08, 10, 11 need service-to-service-latency.jsonl from the run)")
+        if not os.path.exists(s2s_path):
+            print(f"  ⚠ Missing: {s2s_path}")
+            print("    → Create it by running the traffic test (MODE=full or MODE=traffic). Do not delete/copy run without this file.")
     if latency_replicas_rows:
         print(f"  Loaded {len(latency_replicas_rows)} latency-vs-replicas rows")
     else:
         print("  No latency-vs-replicas data (09, 09b need 07-analyze-network-data.py output)")
+        if not os.path.exists(csv_path):
+            print(f"  ⚠ Missing: {csv_path}")
+            print("    → Run 02-analyze-results.sh (or 07-analyze-network-data.py) first; it needs service-to-service-latency.jsonl.")
 
     def _plot(name, func, *args, **kwargs):
         try:
