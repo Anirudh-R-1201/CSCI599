@@ -884,21 +884,31 @@ def main():
     plot_latency_distribution(bursts, output_dir)
     generate_summary_stats(bursts, snapshots, output_dir)
 
-    print("\nLoading network-analysis data for graphs 07–11...")
+    print("\nGenerating network graphs 07–11 (always attempted)...")
     s2s_records = load_s2s_data(data_dir)
     service_to_nodes = load_service_endpoint_nodes(data_dir)
     latency_replicas_rows = load_latency_vs_replicas(data_dir)
     if s2s_records:
         print(f"  Loaded {len(s2s_records)} s2s probe records")
     else:
-        print("  No s2s probe data found (graphs 07–11 may be skipped)")
+        print("  No s2s probe data (07, 08, 10, 11 need service-to-service-latency.jsonl from the run)")
+    if latency_replicas_rows:
+        print(f"  Loaded {len(latency_replicas_rows)} latency-vs-replicas rows")
+    else:
+        print("  No latency-vs-replicas data (09, 09b need 07-analyze-network-data.py output)")
 
-    plot_cross_node_ratio(s2s_records, service_to_nodes, output_dir)
-    plot_same_vs_cross_node_cdf(s2s_records, service_to_nodes, output_dir)
-    plot_p95_vs_replicas(latency_replicas_rows, output_dir)
-    plot_p95_vs_node_count(latency_replicas_rows, output_dir)
-    plot_node_pair_heatmap(s2s_records, output_dir)
-    plot_queueing_vs_rtt(s2s_records, output_dir)
+    def _plot(name, func, *args, **kwargs):
+        try:
+            func(*args, **kwargs)
+        except Exception as e:
+            print(f"  ⚠ {name}: {e}")
+
+    _plot("07_cross_node_ratio", plot_cross_node_ratio, s2s_records, service_to_nodes, output_dir)
+    _plot("08_same_vs_cross_node_cdf", plot_same_vs_cross_node_cdf, s2s_records, service_to_nodes, output_dir)
+    _plot("09_p95_vs_replicas", plot_p95_vs_replicas, latency_replicas_rows, output_dir)
+    _plot("09b_p95_vs_node_count", plot_p95_vs_node_count, latency_replicas_rows, output_dir)
+    _plot("10_node_pair_heatmap", plot_node_pair_heatmap, s2s_records, output_dir)
+    _plot("11_queueing_vs_rtt", plot_queueing_vs_rtt, s2s_records, output_dir)
 
     # Write a short README so viewers know the order
     readme_path = os.path.join(output_dir, "README.txt")
@@ -921,7 +931,7 @@ def main():
     print(f"✓ Generated: {readme_path}")
 
     print(f"\n✓ All graphs generated in: {output_dir}")
-    print("\nView in order (01 → 06) to follow the experiment story. See graphs/README.txt.")
+    print("View in order (01 → 11). See graphs/README.txt.")
 
 
 if __name__ == "__main__":

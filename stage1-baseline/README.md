@@ -72,7 +72,7 @@ See `experiment-metrics-recommendations.md` for the same list and quick facts.
 - If `RUN_DIR` is omitted, latest run under `data/` is used.
 - Runs:
   - `07-analyze-network-data.py`
-  - `06-generate-graphs.py` (only if `matplotlib` is installed)
+  - `06-generate-graphs.py` (installs `matplotlib` if missing so graphs 01–11 run on CloudLab)
 
 Primary outputs:
 
@@ -83,7 +83,7 @@ Primary outputs:
 - `network-analysis/node-pair-latency-summary.json` (p95/p99 by source_node → target_service)
 - `network-analysis/latency-vs-replicas.csv` (HPA desired/current, s2s p95/p99, and **node_count** per timestamp)
 - `network-analysis/experiment-metrics-recommendations.md`
-- `graphs/*.png` (if matplotlib available): 01–06 in story order; 07–11 for network (cross-node ratio, same vs cross-node CDF, **09b p95 vs node count** for cross-node latency cost); see `graphs/README.txt`
+- `graphs/*.png`: 01–06 (load, latency, scaling, placement); 07–11 (cross-node ratio, same vs cross-node CDF, p95 vs replicas/node count, heatmap, queueing vs RTT). See `graphs/README.txt`.
 
 ## Data Layout
 
