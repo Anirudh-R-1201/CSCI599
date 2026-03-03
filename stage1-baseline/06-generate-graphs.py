@@ -513,6 +513,12 @@ def load_latency_vs_replicas(data_dir):
 # Graph 07 – cross-node call ratio per service pair
 # ---------------------------------------------------------------------------
 
+# Canonical list so we always show all boutique services (reduces sparse chart)
+BOUTIQUE_SERVICES = [
+    "frontend", "productcatalogservice", "recommendationservice", "cartservice",
+    "checkoutservice", "paymentservice", "shippingservice", "currencyservice",
+]
+
 def plot_cross_node_ratio(s2s_records, service_to_nodes, output_dir, from_loadgen_only=False):
     """Bar chart: % of cross-node calls per (source_app → target_service) pair."""
     if not s2s_records:
@@ -541,8 +547,27 @@ def plot_cross_node_ratio(s2s_records, service_to_nodes, output_dir, from_loadge
         print("⚠ No pair data for cross-node ratio graph")
         return
 
-    pairs = sorted(pair_counts, key=lambda p: pair_counts[p]["cross"] / max(pair_counts[p]["total"], 1), reverse=True)
-    ratios = [pair_counts[p]["cross"] / max(pair_counts[p]["total"], 1) * 100 for p in pairs]
+    # Show all boutique services for the source(s) we have so the chart isn’t sparse
+    source_apps = sorted({p.split("→", 1)[0] for p in pair_counts})
+    pairs = []
+    for src in source_apps:
+        for svc in BOUTIQUE_SERVICES:
+            pairs.append(f"{src}→{svc}")
+    # If no standard pairs in data, fall back to whatever we have, sorted by ratio
+    if not any(p in pair_counts for p in pairs):
+        pairs = sorted(pair_counts, key=lambda p: pair_counts[p]["cross"] / max(pair_counts[p]["total"], 1), reverse=True)
+    else:
+        # Sort by cross-node ratio descending (high first), then by service name
+        def key(p):
+            c = pair_counts.get(p, {"total": 0, "cross": 0})
+            r = c["cross"] / max(c["total"], 1)
+            return (-r, p)
+        pairs = sorted(pairs, key=key)
+
+    def _ratio(p):
+        c = pair_counts.get(p, {"total": 0, "cross": 0})
+        return c["cross"] / max(c["total"], 1) * 100
+    ratios = [_ratio(p) for p in pairs]
     colors = ["#d73027" if r > 50 else "#fc8d59" if r > 25 else "#91bfdb" for r in ratios]
 
     title = "7. Network: cross-node call ratio per service pair"
@@ -614,7 +639,7 @@ def plot_same_vs_cross_node_cdf(s2s_records, service_to_nodes, output_dir, from_
     ax.set_xlabel("Total latency (ms)", fontsize=12)
     ax.set_ylabel("CDF", fontsize=12)
     ax.set_ylim(0, 1.05)
-    ax.set_title(title, fontsize=14, fontweight="bold")
+    ax.set_title(title + "\n(Same-node = client & service on same host; cross-node = different hosts. CDF = fraction of requests with latency ≤ x.)", fontsize=12, fontweight="bold")
     ax.legend(fontsize=11)
     ax.grid(True, alpha=0.3)
     plt.tight_layout()
@@ -655,13 +680,16 @@ def plot_p95_vs_replicas(latency_replicas_rows, output_dir):
         print("⚠ No data points for p95 vs replicas scatter")
         return
 
+    replica_min, replica_max = min(total_replicas), max(total_replicas)
+    subtitle = f"Replicas in this run: {replica_min}–{replica_max}" if replica_min != replica_max else f"Replicas in this run: {replica_min}"
+
     fig, ax = plt.subplots(figsize=(10, 6))
     sc = ax.scatter(total_replicas, p95_vals, c=range(len(total_replicas)),
                     cmap="plasma", alpha=0.75, s=60, edgecolors="none")
     plt.colorbar(sc, ax=ax, label="Time (snapshot order → later = brighter)")
     ax.set_xlabel("Total current replicas (all services)", fontsize=12)
     ax.set_ylabel("s2s p95 latency (ms)", fontsize=12)
-    ax.set_title("9. Scaling cost: p95 latency vs total running replicas", fontsize=14, fontweight="bold")
+    ax.set_title("9. Scaling cost: p95 latency vs total running replicas\n" + subtitle, fontsize=14, fontweight="bold")
     ax.grid(True, alpha=0.3)
     plt.tight_layout()
     output_path = os.path.join(output_dir, "09_p95_vs_replicas.png")
@@ -695,13 +723,20 @@ def plot_p95_vs_node_count(latency_replicas_rows, output_dir):
         print("⚠ No node_count data in latency-vs-replicas, skipping p95 vs node count graph")
         return
 
+    nc_min, nc_max = min(node_counts), max(node_counts)
+    if nc_min == nc_max:
+        print("⚠ Skipping graph 9b: node count is constant ({}) in this run — no spread variation to plot.".format(nc_min))
+        return
+
+    subtitle = f"Node count in this run: {nc_min}–{nc_max}. Higher spread often increases cross-node latency."
+
     fig, ax = plt.subplots(figsize=(10, 6))
     sc = ax.scatter(node_counts, p95_vals, c=range(len(node_counts)),
                     cmap="viridis", alpha=0.75, s=60, edgecolors="none")
     plt.colorbar(sc, ax=ax, label="Time (snapshot order → later = brighter)")
     ax.set_xlabel("Number of nodes with workload pods", fontsize=12)
     ax.set_ylabel("s2s p95 latency (ms)", fontsize=12)
-    ax.set_title("9b. Cross-node cost: p95 latency vs pod spread across nodes", fontsize=14, fontweight="bold")
+    ax.set_title("9b. Cross-node cost: p95 latency vs pod spread across nodes\n" + subtitle, fontsize=14, fontweight="bold")
     ax.grid(True, alpha=0.3)
     plt.tight_layout()
     output_path = os.path.join(output_dir, "09b_p95_vs_node_count.png")
