@@ -454,7 +454,8 @@ def load_s2s_data(data_dir):
                 if "=" in token:
                     k, v = token.split("=", 1)
                     try:
-                        metrics[k] = float(v) * 1000.0  # s → ms
+                        # Probe string is written in ms (03e: curl s→ms; fortio: already ms)
+                        metrics[k] = float(v)
                     except ValueError:
                         try:
                             metrics[k] = int(v)
@@ -815,6 +816,83 @@ def plot_node_pair_heatmap(s2s_records, output_dir, from_loadgen_only=False):
 
 
 # ---------------------------------------------------------------------------
+# Graph 10b – latency to each service by source node (e.g. frontend: from node1, node2, …)
+# ---------------------------------------------------------------------------
+
+def plot_latency_to_service_by_node(s2s_records, output_dir, from_loadgen_only=False):
+    """Per target service: bar chart of p95 latency from each source node (answers: latency to frontend from each node?)."""
+    if not s2s_records:
+        print("⚠ No s2s data, skipping latency-by-node graph")
+        return
+
+    def short_node(n):
+        return n.split(".")[0]
+
+    pair_latencies = defaultdict(list)
+    for rec in s2s_records:
+        total = rec.get("total")
+        sn = rec.get("source_node", "unknown")
+        ts = rec.get("target_service", "unknown")
+        if total is not None and sn != "unknown" and ts:
+            pair_latencies[(sn, ts)].append(total)
+
+    if not pair_latencies:
+        print("⚠ No data for latency-by-node graph")
+        return
+
+    source_nodes = sorted({k[0] for k in pair_latencies})
+    target_services = [s for s in BOUTIQUE_SERVICES if s in {k[1] for k in pair_latencies}]
+    if not target_services:
+        target_services = sorted({k[1] for k in pair_latencies})
+
+    n_services = len(target_services)
+    n_cols = min(4, n_services)
+    n_rows = (n_services + n_cols - 1) // n_cols
+    fig, axes = plt.subplots(n_rows, n_cols, figsize=(4 * n_cols, 3.5 * n_rows))
+    if n_services == 1:
+        axes = np.array([axes])
+    axes = axes.flatten()
+
+    title_base = "10b. Latency to each service by source node (p95)"
+    if from_loadgen_only:
+        title_base += " (from load generator)"
+    else:
+        title_base += " (client prober → service)"
+    fig.suptitle(title_base + "\nRead: for a given service, each bar = p95 latency when the request came from that node.", fontsize=12, fontweight="bold", y=1.02)
+
+    for idx, ts in enumerate(target_services):
+        ax = axes[idx]
+        node_p95 = []
+        labels = []
+        for sn in source_nodes:
+            vals = sorted(pair_latencies.get((sn, ts), []))
+            if vals:
+                p95 = vals[min(int(len(vals) * 0.95), len(vals) - 1)]
+                node_p95.append(p95)
+                labels.append(short_node(sn))
+        if not node_p95:
+            ax.text(0.5, 0.5, "No data", ha="center", va="center", transform=ax.transAxes)
+            ax.set_title(ts, fontsize=10)
+            ax.set_xticks([])
+            continue
+        colors = ["#2166ac" if i % 2 == 0 else "#4393c3" for i in range(len(labels))]
+        ax.bar(range(len(labels)), node_p95, color=colors, alpha=0.85)
+        ax.set_xticks(range(len(labels)))
+        ax.set_xticklabels(labels, rotation=45, ha="right", fontsize=8)
+        ax.set_ylabel("p95 latency (ms)", fontsize=9)
+        ax.set_title(ts, fontsize=10, fontweight="bold")
+        ax.grid(True, alpha=0.3, axis="y")
+
+    for j in range(n_services, len(axes)):
+        axes[j].set_visible(False)
+    plt.tight_layout()
+    output_path = os.path.join(output_dir, "10b_latency_to_service_by_node.png")
+    plt.savefig(output_path, dpi=300, bbox_inches="tight")
+    print(f"✓ Generated: {output_path}")
+    plt.close()
+
+
+# ---------------------------------------------------------------------------
 # Graph 11 – queueing delay vs network RTT decomposition over time
 # ---------------------------------------------------------------------------
 
@@ -861,6 +939,53 @@ def plot_queueing_vs_rtt(s2s_records, output_dir, from_loadgen_only=False):
     ax.grid(True, alpha=0.3, axis="y")
     plt.tight_layout()
     output_path = os.path.join(output_dir, "11_queueing_vs_rtt.png")
+    plt.savefig(output_path, dpi=300, bbox_inches="tight")
+    print(f"✓ Generated: {output_path}")
+    plt.close()
+
+
+# ---------------------------------------------------------------------------
+# Graph 11b – network delay only (RTT / connect time over time)
+# ---------------------------------------------------------------------------
+
+def plot_network_rtt_only(s2s_records, output_dir, from_loadgen_only=False):
+    """Line/area: network RTT (connect time) only over probe snapshots — Y-axis scaled for network delay."""
+    if not s2s_records:
+        print("⚠ No s2s data, skipping network RTT-only graph")
+        return
+
+    by_ts = defaultdict(list)
+    for rec in s2s_records:
+        connect = rec.get("connect")
+        ts = rec.get("timestamp", "")
+        if connect is not None and connect >= 0 and ts:
+            by_ts[ts].append(connect)
+
+    if not by_ts:
+        print("⚠ No connect data for network RTT-only graph")
+        return
+
+    sorted_ts = sorted(by_ts)
+    mean_connect = [np.mean(by_ts[ts]) for ts in sorted_ts]
+    x = range(len(sorted_ts))
+
+    title = "11b. Network delay only: RTT (connect time) over time"
+    if from_loadgen_only:
+        title += " (from load generator)"
+    else:
+        title += " (client prober → service)"
+
+    fig, ax = plt.subplots(figsize=(14, 5))
+    ax.fill_between(x, mean_connect, alpha=0.4, color="#4393c3")
+    ax.plot(x, mean_connect, color="#2166ac", linewidth=2, label="Mean network RTT (connect)")
+    ax.set_xlabel("Probe snapshot (time order)", fontsize=12)
+    ax.set_ylabel("Network RTT (ms)", fontsize=12)
+    ax.set_title(title, fontsize=14, fontweight="bold")
+    ax.legend(loc="upper right", fontsize=10)
+    ax.grid(True, alpha=0.3, axis="y")
+    ax.set_ylim(0, None)  # Start at 0 so network delay is visible on its own scale
+    plt.tight_layout()
+    output_path = os.path.join(output_dir, "11b_network_rtt_only.png")
     plt.savefig(output_path, dpi=300, bbox_inches="tight")
     print(f"✓ Generated: {output_path}")
     plt.close()
@@ -983,7 +1108,9 @@ def main():
     _plot("09_p95_vs_replicas", plot_p95_vs_replicas, latency_replicas_rows, output_dir)
     _plot("09b_p95_vs_node_count", plot_p95_vs_node_count, latency_replicas_rows, output_dir)
     _plot("10_node_pair_heatmap", plot_node_pair_heatmap, s2s_for_network, output_dir, from_loadgen_only=from_loadgen_only)
+    _plot("10b_latency_to_service_by_node", plot_latency_to_service_by_node, s2s_for_network, output_dir, from_loadgen_only=from_loadgen_only)
     _plot("11_queueing_vs_rtt", plot_queueing_vs_rtt, s2s_for_network, output_dir, from_loadgen_only=from_loadgen_only)
+    _plot("11b_network_rtt_only", plot_network_rtt_only, s2s_for_network, output_dir, from_loadgen_only=from_loadgen_only)
 
     # Write a short README so viewers know the order
     readme_path = os.path.join(output_dir, "README.txt")
@@ -1001,7 +1128,9 @@ def main():
         f.write("  09_p95_vs_replicas.png            – p95 latency vs total running replicas (HPA scaling cost)\n")
         f.write("  09b_p95_vs_node_count.png        – p95 latency vs nodes with pods (cross-node latency cost)\n")
         f.write("  10_node_pair_latency_heatmap.png  – p95 latency heatmap: source node × target service\n")
-        f.write("  11_queueing_vs_rtt.png            – Decomposition: network RTT vs server queueing delay\n\n")
+        f.write("  10b_latency_to_service_by_node.png – Latency to each service by source node (e.g. frontend: from node1, node2, …)\n")
+        f.write("  11_queueing_vs_rtt.png            – Decomposition: network RTT vs server queueing delay\n")
+        f.write("  11b_network_rtt_only.png          – Network delay only: RTT (connect time) over time\n\n")
         f.write("  summary_stats.txt                 – Numeric summary\n")
     print(f"✓ Generated: {readme_path}")
 

@@ -267,7 +267,8 @@ def parse_probe_kv(raw: str) -> dict:
                 continue
         else:
             try:
-                out[k] = float(v) * 1000.0
+                # Probe string is written in ms (03e: curl s→ms; fortio: already ms)
+                out[k] = float(v)
             except Exception:
                 continue
     return out
