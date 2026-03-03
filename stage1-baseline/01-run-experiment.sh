@@ -78,6 +78,12 @@ setup_hpa() {
   CPU_THRESHOLD="${CPU_THRESHOLD}" "${ROOT_DIR}/07-setup-hpa.sh"
 }
 
+# Deploy s2s-prober so service-to-service probes run from a client-like pod (not the load generator).
+ensure_s2s_prober() {
+  kubectl --kubeconfig "${KUBECONFIG_PATH}" apply -f "${ROOT_DIR}/s2s-prober.yaml" >/dev/null
+  kubectl --kubeconfig "${KUBECONFIG_PATH}" wait --for=condition=Available deployment/s2s-prober --timeout=120s 2>/dev/null || true
+}
+
 run_traffic() {
   BURSTS="${BURSTS}" \
   BASE_BURST_SECONDS="${BASE_BURST_SECONDS}" \
@@ -182,6 +188,7 @@ case "${MODE}" in
     setup_hpa
     ;;
   traffic)
+    ensure_s2s_prober
     run_traffic
     ;;
   full)
@@ -189,6 +196,7 @@ case "${MODE}" in
     ensure_metrics_server
     deploy_workload_if_needed
     setup_hpa
+    ensure_s2s_prober
     run_traffic
     collect_baseline
     ;;

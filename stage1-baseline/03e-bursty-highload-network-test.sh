@@ -55,6 +55,16 @@ echo "Deploying or refreshing fortio load generator..."
 kubectl --kubeconfig "${KUBECONFIG_PATH}" apply -f "${ROOT_DIR}/fortio-loadgen.yaml" >/dev/null
 kubectl --kubeconfig "${KUBECONFIG_PATH}" wait --for=condition=Ready pod/fortio-loadgen --timeout=180s >/dev/null
 
+# Prefer s2s-prober for service-to-service probes (client → boutique services); fall back to fortio-loadgen
+S2S_SOURCE_POD=$(kubectl --kubeconfig "${KUBECONFIG_PATH}" get pods -l app=s2s-prober -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)
+if [ -z "${S2S_SOURCE_POD}" ]; then
+  S2S_SOURCE_POD="fortio-loadgen"
+  echo "Using fortio-loadgen for s2s probes (s2s-prober not found; graphs will show loadgen→service)."
+else
+  echo "Using ${S2S_SOURCE_POD} for s2s probes (client→boutique service)."
+fi
+export S2S_SOURCE_POD
+
 echo "Checking HPA targets (expecting 75% if configured that way)..."
 kubectl --kubeconfig "${KUBECONFIG_PATH}" get hpa -o wide > "${NET_DIR}/hpa-before.txt" || true
 
@@ -79,15 +89,13 @@ capture_cluster_snapshot() {
 probe_service_latencies() {
   local timestamp="$1"
   local targets="$2"
-
-  # fortio/fortio image does not include curl. Use fortio's built-in HTTP client for probes.
-  local source_pod="fortio-loadgen"
+  local source_pod="${S2S_SOURCE_POD:-fortio-loadgen}"
   local source_node
   source_node=$(kubectl --kubeconfig "${KUBECONFIG_PATH}" get pod "${source_pod}" \
     -o jsonpath='{.spec.nodeName}' 2>/dev/null || echo "unknown")
 
   if [ -z "${source_node}" ] || [ "${source_node}" = "unknown" ]; then
-    echo "⚠ probe_service_latencies: fortio-loadgen pod not found or node unknown, skipping" >&2
+    echo "⚠ probe_service_latencies: ${source_pod} not found or node unknown, skipping" >&2
     return 0
   fi
 
@@ -97,10 +105,13 @@ probe_service_latencies() {
     t="$(echo "${target}" | xargs)"
     [ -z "${t}" ] && continue
     for ((k=0; k<S2S_PROBE_REPEAT; k++)); do
-      local raw probe
-      raw=$(kubectl --kubeconfig "${KUBECONFIG_PATH}" exec "${source_pod}" -- \
-        fortio load -n 1 -qps 1 -json - "http://${t}:80/" 2>/dev/null || true)
-      probe=$(echo "${raw}" | python3 -c "
+      local probe
+      if [ "${source_pod}" = "fortio-loadgen" ]; then
+        # fortio image has no curl; use fortio load
+        local raw
+        raw=$(kubectl --kubeconfig "${KUBECONFIG_PATH}" exec "${source_pod}" -- \
+          fortio load -n 1 -qps 1 -json - "http://${t}:80/" 2>/dev/null || true)
+        probe=$(echo "${raw}" | python3 -c "
 import json, sys
 try:
     d = json.load(sys.stdin)
@@ -121,6 +132,32 @@ try:
 except Exception:
     pass
 " 2>/dev/null || true)
+      else
+        # s2s-prober (or any pod with curl)
+        probe=$(kubectl --kubeconfig "${KUBECONFIG_PATH}" exec "${source_pod}" -- \
+          curl -sS -o /dev/null \
+            -w 'dns=%{time_namelookup} connect=%{time_connect} ttfb=%{time_starttransfer} total=%{time_total} code=%{http_code}' \
+            --max-time 5 "http://${t}:80/" 2>/dev/null || true)
+        # curl gives seconds; convert to ms for consistency
+        probe=$(echo "${probe}" | python3 -c "
+import sys
+s = sys.stdin.read().strip()
+out = []
+for part in s.split():
+    if '=' in part:
+        k, v = part.split('=', 1)
+        if k == 'code':
+            out.append('{}={}'.format(k, v))
+        else:
+            try:
+                out.append('{}={:.2f}'.format(k, float(v)*1000))
+            except ValueError:
+                out.append(part)
+    else:
+        out.append(part)
+print(' '.join(out))
+" 2>/dev/null || true)
+      fi
 
       if [ -n "${probe}" ]; then
         printf '{"timestamp":"%s","source_pod":"%s","source_node":"%s","target_service":"%s","probe":"%s"}\n' \
@@ -257,8 +294,8 @@ s2s_lines=$(wc -l < "${S2S_FILE}" 2>/dev/null || echo "0")
 if [ "${s2s_lines}" -eq 0 ]; then
   echo ""
   echo "⚠ WARNING: service-to-service-latency.jsonl is empty. Graphs 07-11 will not be generated."
-  echo "  Check: kubectl get pod fortio-loadgen"
-  echo "  Test:  kubectl exec fortio-loadgen -- curl -s -o /dev/null -w '%{http_code}' http://frontend:80/"
+  echo "  Check: kubectl get pod fortio-loadgen; kubectl get pod -l app=s2s-prober"
+  echo "  Test:  kubectl exec <s2s-prober-pod> -- curl -s -o /dev/null -w '%{http_code}' http://frontend:80/"
   echo "  Log:   ${NET_DIR}/monitoring.log"
   echo ""
 fi

@@ -1,0 +1,29 @@
+# Dedicated pod for service-to-service latency probes (client → boutique services).
+# Used so network graphs show "prober → service" instead of "load generator → service".
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: s2s-prober
+  labels:
+    app: s2s-prober
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: s2s-prober
+  template:
+    metadata:
+      labels:
+        app: s2s-prober
+    spec:
+      containers:
+        - name: curl
+          image: curlimages/curl:latest
+          command: ["sleep", "infinity"]
+          resources:
+            requests:
+              cpu: 10m
+              memory: 32Mi
+            limits:
+              cpu: 100m
+              memory: 64Mi

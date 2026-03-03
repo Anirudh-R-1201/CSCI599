@@ -513,7 +513,7 @@ def load_latency_vs_replicas(data_dir):
 # Graph 07 – cross-node call ratio per service pair
 # ---------------------------------------------------------------------------
 
-def plot_cross_node_ratio(s2s_records, service_to_nodes, output_dir):
+def plot_cross_node_ratio(s2s_records, service_to_nodes, output_dir, from_loadgen_only=False):
     """Bar chart: % of cross-node calls per (source_app → target_service) pair."""
     if not s2s_records:
         print("⚠ No s2s data, skipping cross-node ratio graph")
@@ -521,7 +521,10 @@ def plot_cross_node_ratio(s2s_records, service_to_nodes, output_dir):
 
     def pod_to_app(pod_name):
         parts = pod_name.rsplit("-", 2)
-        return parts[0] if len(parts) >= 2 else pod_name
+        base = parts[0] if len(parts) >= 2 else pod_name
+        if (base or "").lower() == "s2s" or (pod_name or "").startswith("s2s-prober"):
+            return "prober"
+        return base
 
     pair_counts = defaultdict(lambda: {"total": 0, "cross": 0})
     for rec in s2s_records:
@@ -542,6 +545,12 @@ def plot_cross_node_ratio(s2s_records, service_to_nodes, output_dir):
     ratios = [pair_counts[p]["cross"] / max(pair_counts[p]["total"], 1) * 100 for p in pairs]
     colors = ["#d73027" if r > 50 else "#fc8d59" if r > 25 else "#91bfdb" for r in ratios]
 
+    title = "7. Network: cross-node call ratio per service pair"
+    if from_loadgen_only:
+        title += " (from load generator; deploy s2s-prober for client→service)"
+    else:
+        title += " (client prober → boutique service)"
+
     fig, ax = plt.subplots(figsize=(max(10, len(pairs) * 0.55), 6))
     ax.bar(range(len(pairs)), ratios, color=colors, alpha=0.88)
     ax.axhline(50, color="red", linestyle="--", linewidth=1, alpha=0.5, label="50% threshold")
@@ -549,7 +558,7 @@ def plot_cross_node_ratio(s2s_records, service_to_nodes, output_dir):
     ax.set_xticklabels(pairs, rotation=45, ha="right", fontsize=8)
     ax.set_ylabel("Cross-node calls (%)", fontsize=12)
     ax.set_ylim(0, 108)
-    ax.set_title("7. Network: cross-node call ratio per service pair", fontsize=14, fontweight="bold")
+    ax.set_title(title, fontsize=14, fontweight="bold")
     ax.legend(fontsize=10)
     ax.grid(True, alpha=0.3, axis="y")
     plt.tight_layout()
@@ -563,7 +572,7 @@ def plot_cross_node_ratio(s2s_records, service_to_nodes, output_dir):
 # Graph 08 – same-node vs cross-node latency CDF
 # ---------------------------------------------------------------------------
 
-def plot_same_vs_cross_node_cdf(s2s_records, service_to_nodes, output_dir):
+def plot_same_vs_cross_node_cdf(s2s_records, service_to_nodes, output_dir, from_loadgen_only=False):
     """CDF of total latency split into same-node vs cross-node calls."""
     if not s2s_records:
         print("⚠ No s2s data, skipping CDF graph")
@@ -587,6 +596,12 @@ def plot_same_vs_cross_node_cdf(s2s_records, service_to_nodes, output_dir):
         print("⚠ No latency data for CDF graph")
         return
 
+    title = "8. Network penalty: same-node vs cross-node latency CDF"
+    if from_loadgen_only:
+        title += " (from load generator)"
+    else:
+        title += " (client prober → service)"
+
     fig, ax = plt.subplots(figsize=(10, 6))
     for latencies, label, color in [
         (same_node,  f"Same-node  (n={len(same_node)})",  "#2166ac"),
@@ -599,7 +614,7 @@ def plot_same_vs_cross_node_cdf(s2s_records, service_to_nodes, output_dir):
     ax.set_xlabel("Total latency (ms)", fontsize=12)
     ax.set_ylabel("CDF", fontsize=12)
     ax.set_ylim(0, 1.05)
-    ax.set_title("8. Network penalty: same-node vs cross-node latency CDF", fontsize=14, fontweight="bold")
+    ax.set_title(title, fontsize=14, fontweight="bold")
     ax.legend(fontsize=11)
     ax.grid(True, alpha=0.3)
     plt.tight_layout()
@@ -699,7 +714,7 @@ def plot_p95_vs_node_count(latency_replicas_rows, output_dir):
 # Graph 10 – node-pair p95 latency heatmap
 # ---------------------------------------------------------------------------
 
-def plot_node_pair_heatmap(s2s_records, output_dir):
+def plot_node_pair_heatmap(s2s_records, output_dir, from_loadgen_only=False):
     """Heatmap: p95 latency by (source_node × target_service)."""
     if not s2s_records:
         print("⚠ No s2s data, skipping node-pair heatmap")
@@ -730,6 +745,12 @@ def plot_node_pair_heatmap(s2s_records, output_dir):
             if vals:
                 matrix[i][j] = vals[min(int(len(vals) * 0.95), len(vals) - 1)]
 
+    title = "10. Topology: p95 latency by source node → target service"
+    if from_loadgen_only:
+        title += " (from load generator)"
+    else:
+        title += " (client prober → service)"
+
     fig, ax = plt.subplots(figsize=(max(10, len(target_services) * 0.9), max(4, len(source_nodes) * 0.9)))
     masked = np.ma.masked_invalid(matrix)
     im = ax.imshow(masked, cmap="YlOrRd", aspect="auto")
@@ -741,7 +762,7 @@ def plot_node_pair_heatmap(s2s_records, output_dir):
     ax.set_yticklabels([short_node(n) for n in source_nodes], fontsize=9)
     ax.set_xlabel("Target service", fontsize=12)
     ax.set_ylabel("Source node", fontsize=12)
-    ax.set_title("10. Topology: p95 latency by source node → target service", fontsize=14, fontweight="bold")
+    ax.set_title(title, fontsize=14, fontweight="bold")
 
     vmax = np.nanmax(matrix) if not np.all(np.isnan(matrix)) else 1
     for i in range(len(source_nodes)):
@@ -762,7 +783,7 @@ def plot_node_pair_heatmap(s2s_records, output_dir):
 # Graph 11 – queueing delay vs network RTT decomposition over time
 # ---------------------------------------------------------------------------
 
-def plot_queueing_vs_rtt(s2s_records, output_dir):
+def plot_queueing_vs_rtt(s2s_records, output_dir, from_loadgen_only=False):
     """Stacked area: mean network RTT (connect) vs queueing (ttfb − connect) per snapshot."""
     if not s2s_records:
         print("⚠ No s2s data, skipping queueing vs RTT graph")
@@ -788,14 +809,19 @@ def plot_queueing_vs_rtt(s2s_records, output_dir):
     mean_queueing = [np.mean(by_ts[ts]["queueing"]) for ts in sorted_ts]
     x = range(len(sorted_ts))
 
+    title = "11. Decomposition: network RTT vs server queueing delay over time"
+    if from_loadgen_only:
+        title += " (from load generator)"
+    else:
+        title += " (client prober → service)"
+
     fig, ax = plt.subplots(figsize=(14, 6))
     ax.stackplot(x, mean_connect, mean_queueing,
                  labels=["Network RTT (connect)", "Queueing delay (ttfb − connect)"],
                  colors=["#4393c3", "#d6604d"], alpha=0.85)
     ax.set_xlabel("Probe snapshot (time order)", fontsize=12)
     ax.set_ylabel("Latency (ms)", fontsize=12)
-    ax.set_title("11. Decomposition: network RTT vs server queueing delay over time",
-                 fontsize=14, fontweight="bold")
+    ax.set_title(title, fontsize=14, fontweight="bold")
     ax.legend(loc="upper left", fontsize=10)
     ax.grid(True, alpha=0.3, axis="y")
     plt.tight_layout()
@@ -911,12 +937,18 @@ def main():
         except Exception as e:
             print(f"  ⚠ {name}: {e}")
 
-    _plot("07_cross_node_ratio", plot_cross_node_ratio, s2s_records, service_to_nodes, output_dir)
-    _plot("08_same_vs_cross_node_cdf", plot_same_vs_cross_node_cdf, s2s_records, service_to_nodes, output_dir)
+    # Prefer client/prober → service (exclude load generator) for network graphs
+    LOADGEN_SOURCE = "fortio-loadgen"
+    s2s_boutique = [r for r in (s2s_records or []) if (r.get("source_pod") or "").strip() != LOADGEN_SOURCE]
+    s2s_for_network = s2s_boutique if s2s_boutique else (s2s_records or [])
+    from_loadgen_only = bool(s2s_records) and not s2s_boutique
+
+    _plot("07_cross_node_ratio", plot_cross_node_ratio, s2s_for_network, service_to_nodes, output_dir, from_loadgen_only=from_loadgen_only)
+    _plot("08_same_vs_cross_node_cdf", plot_same_vs_cross_node_cdf, s2s_for_network, service_to_nodes, output_dir, from_loadgen_only=from_loadgen_only)
     _plot("09_p95_vs_replicas", plot_p95_vs_replicas, latency_replicas_rows, output_dir)
     _plot("09b_p95_vs_node_count", plot_p95_vs_node_count, latency_replicas_rows, output_dir)
-    _plot("10_node_pair_heatmap", plot_node_pair_heatmap, s2s_records, output_dir)
-    _plot("11_queueing_vs_rtt", plot_queueing_vs_rtt, s2s_records, output_dir)
+    _plot("10_node_pair_heatmap", plot_node_pair_heatmap, s2s_for_network, output_dir, from_loadgen_only=from_loadgen_only)
+    _plot("11_queueing_vs_rtt", plot_queueing_vs_rtt, s2s_for_network, output_dir, from_loadgen_only=from_loadgen_only)
 
     # Write a short README so viewers know the order
     readme_path = os.path.join(output_dir, "README.txt")
