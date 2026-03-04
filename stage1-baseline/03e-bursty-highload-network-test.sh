@@ -55,15 +55,34 @@ echo "Deploying or refreshing fortio load generator..."
 kubectl --kubeconfig "${KUBECONFIG_PATH}" apply -f "${ROOT_DIR}/fortio-loadgen.yaml" >/dev/null
 kubectl --kubeconfig "${KUBECONFIG_PATH}" wait --for=condition=Ready pod/fortio-loadgen --timeout=180s >/dev/null
 
-# Prefer s2s-prober for service-to-service probes (client → boutique services); fall back to fortio-loadgen
+# Prefer s2s-prober for HTTP service-to-service probes (client → boutique services); fall back to fortio-loadgen.
+# gRPC services are always probed via fortio-loadgen using fortio's built-in gRPC health check.
 S2S_SOURCE_POD=$(kubectl --kubeconfig "${KUBECONFIG_PATH}" get pods -l app=s2s-prober -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)
 if [ -z "${S2S_SOURCE_POD}" ]; then
   S2S_SOURCE_POD="fortio-loadgen"
-  echo "Using fortio-loadgen for s2s probes (s2s-prober not found; graphs will show loadgen→service)."
+  echo "Using fortio-loadgen for HTTP s2s probes (s2s-prober not found)."
 else
-  echo "Using ${S2S_SOURCE_POD} for s2s probes (client→boutique service)."
+  echo "Using ${S2S_SOURCE_POD} for HTTP s2s probes; fortio-loadgen for gRPC probes."
 fi
 export S2S_SOURCE_POD
+
+# Map each service to its protocol and port.
+# HTTP services are probed via curl (fast timing breakdown: dns/connect/ttfb/total).
+# gRPC services are probed via fortio health check (total latency only).
+get_service_proto_port() {
+  case "$1" in
+    frontend)                echo "http:80"    ;;
+    productcatalogservice)   echo "grpc:3550"  ;;
+    recommendationservice)   echo "grpc:8080"  ;;
+    cartservice)             echo "grpc:7070"  ;;
+    checkoutservice)         echo "grpc:5050"  ;;
+    paymentservice)          echo "grpc:50051" ;;
+    shippingservice)         echo "grpc:50051" ;;
+    currencyservice)         echo "grpc:7000"  ;;
+    emailservice)            echo "grpc:5000"  ;;
+    *)                       echo "http:80"    ;;
+  esac
+}
 
 echo "Checking HPA targets (expecting 75% if configured that way)..."
 kubectl --kubeconfig "${KUBECONFIG_PATH}" get hpa -o wide > "${NET_DIR}/hpa-before.txt" || true
@@ -89,13 +108,18 @@ capture_cluster_snapshot() {
 probe_service_latencies() {
   local timestamp="$1"
   local targets="$2"
-  local source_pod="${S2S_SOURCE_POD:-fortio-loadgen}"
-  local source_node
-  source_node=$(kubectl --kubeconfig "${KUBECONFIG_PATH}" get pod "${source_pod}" \
+  local http_pod="${S2S_SOURCE_POD:-fortio-loadgen}"
+  local grpc_pod="fortio-loadgen"
+
+  # Resolve source node for the HTTP prober (used for topology graphs).
+  local http_node grpc_node
+  http_node=$(kubectl --kubeconfig "${KUBECONFIG_PATH}" get pod "${http_pod}" \
+    -o jsonpath='{.spec.nodeName}' 2>/dev/null || echo "unknown")
+  grpc_node=$(kubectl --kubeconfig "${KUBECONFIG_PATH}" get pod "${grpc_pod}" \
     -o jsonpath='{.spec.nodeName}' 2>/dev/null || echo "unknown")
 
-  if [ -z "${source_node}" ] || [ "${source_node}" = "unknown" ]; then
-    echo "⚠ probe_service_latencies: ${source_pod} not found or node unknown, skipping" >&2
+  if [ -z "${http_node}" ] || [ "${http_node}" = "unknown" ]; then
+    echo "⚠ probe_service_latencies: ${http_pod} has unknown node, skipping" >&2
     return 0
   fi
 
@@ -104,41 +128,76 @@ probe_service_latencies() {
     local t
     t="$(echo "${target}" | xargs)"
     [ -z "${t}" ] && continue
+
+    local proto_port
+    proto_port="$(get_service_proto_port "${t}")"
+    local proto="${proto_port%%:*}"
+    local port="${proto_port##*:}"
+
     for ((k=0; k<S2S_PROBE_REPEAT; k++)); do
-      local probe
-      if [ "${source_pod}" = "fortio-loadgen" ]; then
-        # fortio image has no curl; use fortio load
+      local probe source_pod source_node
+
+      if [ "${proto}" = "grpc" ]; then
+        # ── gRPC probe via fortio health check ──────────────────────────────
+        # Uses the standard gRPC health check protocol (grpc.health.v1.Health/Check).
+        # All Online Boutique gRPC services expose this endpoint (confirmed via K8s grpc probes).
+        # Output: dns=0 connect=0 ttfb=<p50_ms> total=<avg_ms> code=<grpc_code> grpc=1
+        # gRPC codes: 0=OK, 2=UNKNOWN, 12=UNIMPLEMENTED, 14=UNAVAILABLE
+        source_pod="${grpc_pod}"
+        source_node="${grpc_node}"
         local raw
-        raw=$(kubectl --kubeconfig "${KUBECONFIG_PATH}" exec "${source_pod}" -- \
-          fortio load -n 1 -qps 1 -json - "http://${t}:80/" 2>/dev/null || true)
+        raw=$(kubectl --kubeconfig "${KUBECONFIG_PATH}" exec "${grpc_pod}" -- \
+          fortio load -grpc -grpc-health-svc "" \
+            -c 1 -n 1 -qps 0 -json - "${t}:${port}" 2>/dev/null || true)
         probe=$(echo "${raw}" | python3 -c "
 import json, sys
 try:
     d = json.load(sys.stdin)
-    rr = d.get('RunnerResults') or []
-    h = d.get('DurationHistogram')
-    if not h and rr and isinstance(rr, list):
-        h = rr[0].get('DurationHistogram') if rr else {}
-    h = h or {}
-    avg_s = float(h.get('Avg', 0))
-    total_ms = avg_s * 1000
-    codes = d.get('RetCodes')
-    if not codes and rr and isinstance(rr, list):
-        codes = rr[0].get('RetCodes') if rr else {}
-    codes = codes or {}
-    code = int(list(codes.keys())[0]) if codes else 0
-    if total_ms >= 0:
-        print('dns=0 connect={:.2f} ttfb={:.2f} total={:.2f} code={}'.format(total_ms*0.3, total_ms*0.7, total_ms, code))
+    h = d.get('DurationHistogram') or {}
+    avg_ms = float(h.get('Avg', 0)) * 1000
+    pcts = {float(p['Percentile']): float(p['Value']) * 1000
+            for p in h.get('Percentiles', []) if 'Percentile' in p and 'Value' in p}
+    p50_ms = pcts.get(50.0, avg_ms)
+    codes = d.get('RetCodes') or {}
+    # Pick the dominant response code (most frequent key in RetCodes)
+    code = sorted(codes.items(), key=lambda x: -x[1])[0][0] if codes else 0
+    print('dns=0 connect=0 ttfb={:.2f} total={:.2f} code={} grpc=1'.format(
+        p50_ms, avg_ms, int(code)))
+except Exception as e:
+    sys.stderr.write('grpc-probe-parse-error: {}\n'.format(e))
+" 2>/dev/null || true)
+
+      elif [ "${http_pod}" = "fortio-loadgen" ]; then
+        # ── HTTP probe via fortio (no curl available in fortio image) ────────
+        source_pod="${http_pod}"
+        source_node="${http_node}"
+        local raw
+        raw=$(kubectl --kubeconfig "${KUBECONFIG_PATH}" exec "${http_pod}" -- \
+          fortio load -c 1 -n 1 -qps 0 -json - "http://${t}:${port}/" 2>/dev/null || true)
+        probe=$(echo "${raw}" | python3 -c "
+import json, sys
+try:
+    d = json.load(sys.stdin)
+    h = d.get('DurationHistogram') or {}
+    avg_ms = float(h.get('Avg', 0)) * 1000
+    codes = d.get('RetCodes') or {}
+    code = sorted(codes.items(), key=lambda x: -x[1])[0][0] if codes else 0
+    # Approximate timing breakdown (fortio HTTP does not expose dns/connect/ttfb separately)
+    print('dns=0 connect={:.2f} ttfb={:.2f} total={:.2f} code={}'.format(
+        avg_ms * 0.05, avg_ms * 0.6, avg_ms, int(code)))
 except Exception:
     pass
 " 2>/dev/null || true)
+
       else
-        # s2s-prober (or any pod with curl)
-        probe=$(kubectl --kubeconfig "${KUBECONFIG_PATH}" exec "${source_pod}" -- \
+        # ── HTTP probe via curl (s2s-prober pod — gives full timing breakdown) ──
+        # curl write-out fields are in seconds; convert to ms.
+        source_pod="${http_pod}"
+        source_node="${http_node}"
+        probe=$(kubectl --kubeconfig "${KUBECONFIG_PATH}" exec "${http_pod}" -- \
           curl -sS -o /dev/null \
             -w 'dns=%{time_namelookup} connect=%{time_connect} ttfb=%{time_starttransfer} total=%{time_total} code=%{http_code}' \
-            --max-time 5 "http://${t}:80/" 2>/dev/null || true)
-        # curl gives seconds; convert to ms for consistency
+            --max-time 5 "http://${t}:${port}/" 2>/dev/null || true)
         probe=$(echo "${probe}" | python3 -c "
 import sys
 s = sys.stdin.read().strip()
@@ -150,7 +209,7 @@ for part in s.split():
             out.append('{}={}'.format(k, v))
         else:
             try:
-                out.append('{}={:.2f}'.format(k, float(v)*1000))
+                out.append('{}={:.2f}'.format(k, float(v) * 1000))
             except ValueError:
                 out.append(part)
     else:

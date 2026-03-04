@@ -209,6 +209,7 @@ def load_s2s_data(data_dir):
                 "source_pod": row.get("source_pod", "unknown"),
                 "source_node": row.get("source_node", "unknown"),
                 "target_service": row.get("target_service", "unknown"),
+                "is_grpc": bool(metrics.get("grpc")),
                 **metrics,
             })
     return records
@@ -731,15 +732,17 @@ def plot_same_vs_cross_node_cdf(s2s_records, service_to_nodes, output_dir, from_
         print("⚠ No s2s data, skipping graph 08")
         return
 
-    # Filter to successful probes only (code=200 or code not present)
+    # Filter to successful probes only (HTTP: code 200; gRPC: code 0; or code not present)
     same_node, cross_node = [], []
     for rec in s2s_records:
         total = rec.get("total")
         code  = rec.get("code")
         if total is None:
             continue
-        if code is not None and int(code) != 200:
-            continue
+        if code is not None:
+            ok_code = 0 if rec.get("is_grpc") else 200
+            if int(code) != ok_code:
+                continue
         sn = rec.get("source_node", "unknown")
         tnodes = service_to_nodes.get(rec.get("target_service", ""), set())
         if sn == "unknown" or not tnodes:
@@ -909,15 +912,30 @@ def plot_node_pair_heatmap(s2s_records, output_dir, from_loadgen_only=False):
 # Graph 10b – Latency to each service by source node (annotates gRPC failures)
 # ---------------------------------------------------------------------------
 
-def _is_grpc_probe_failure(latencies, codes):
-    """True if the probe could not speak to this service (all timeouts, code=000)."""
+def _is_grpc_probe_failure(latencies, codes, is_grpc_flags=None):
+    """True if the probe could not reach this service.
+
+    HTTP probes: success = code 200. Failures show code=000 and total≈5000ms (curl timeout).
+    gRPC probes: success = code 0 (gRPC OK). Non-zero codes are real gRPC errors, not timeouts.
+    If is_grpc_flags is provided (list of bool), use it to determine probe type per record.
+    """
     if not latencies:
         return False
-    pct_timeout = sum(1 for v in latencies if v > 4990) / len(latencies)
+    # Determine if this service's probes are gRPC or HTTP
+    is_grpc = bool(is_grpc_flags and sum(is_grpc_flags) > len(is_grpc_flags) / 2)
     if codes:
-        pct_fail = sum(1 for c in codes if int(c) != 200) / len(codes)
+        if is_grpc:
+            # gRPC OK = code 0; anything else is a real error
+            pct_fail = sum(1 for c in codes if int(c) != 0) / len(codes)
+        else:
+            # HTTP: code 200 = success; code 000 = curl timeout / connection refused
+            pct_fail = sum(1 for c in codes if int(c) not in (200, 201, 204)) / len(codes)
         return pct_fail > 0.85
-    return pct_timeout > 0.85
+    # Fallback: latency-based heuristic (HTTP curl timeout = 5000ms)
+    if not is_grpc:
+        pct_timeout = sum(1 for v in latencies if v > 4990) / len(latencies)
+        return pct_timeout > 0.85
+    return False
 
 
 def plot_latency_to_service_by_node(s2s_records, output_dir, from_loadgen_only=False):
@@ -927,6 +945,7 @@ def plot_latency_to_service_by_node(s2s_records, output_dir, from_loadgen_only=F
 
     pair_latencies = defaultdict(list)
     pair_codes     = defaultdict(list)
+    pair_is_grpc   = defaultdict(list)
     for rec in s2s_records:
         total = rec.get("total")
         sn = rec.get("source_node", "unknown")
@@ -934,6 +953,7 @@ def plot_latency_to_service_by_node(s2s_records, output_dir, from_loadgen_only=F
         code = rec.get("code")
         if total is not None and sn != "unknown" and ts:
             pair_latencies[(sn, ts)].append(total)
+            pair_is_grpc[(sn, ts)].append(rec.get("is_grpc", False))
             if code is not None:
                 pair_codes[(sn, ts)].append(code)
     if not pair_latencies:
@@ -965,8 +985,9 @@ def plot_latency_to_service_by_node(s2s_records, output_dir, from_loadgen_only=F
         for sn in src_nodes:
             vals = pair_latencies.get((sn, ts), [])
             codes = pair_codes.get((sn, ts), [])
+            grpc_flags = pair_is_grpc.get((sn, ts), [])
             if vals:
-                fail = _is_grpc_probe_failure(vals, codes)
+                fail = _is_grpc_probe_failure(vals, codes, grpc_flags)
                 if fail:
                     is_failure = True
                     break
@@ -980,10 +1001,11 @@ def plot_latency_to_service_by_node(s2s_records, output_dir, from_loadgen_only=F
                     transform=ax.transAxes, fontsize=11, fontweight="bold", color="#333")
             ax.text(0.5, 0.40, "gRPC service", ha="center", va="center",
                     transform=ax.transAxes, fontsize=9, color="#c00000")
-            ax.text(0.5, 0.25, "HTTP probe not supported", ha="center", va="center",
+            ax.text(0.5, 0.25, "HTTP probe unsupported", ha="center", va="center",
                     transform=ax.transAxes, fontsize=8, color="#888")
-            ax.text(0.5, 0.12, "→ Deploy gRPC prober", ha="center", va="center",
-                    transform=ax.transAxes, fontsize=8, color="#888", style="italic")
+            ax.text(0.5, 0.12, "→ gRPC prober now active (run next experiment)", ha="center",
+                    va="center", transform=ax.transAxes, fontsize=7.5, color="#2166ac",
+                    style="italic")
             ax.set_xticks([])
             ax.set_yticks([])
         else:
@@ -1009,12 +1031,14 @@ def plot_queueing_vs_rtt(s2s_records, output_dir, from_loadgen_only=False):
     if not s2s_records:
         print("⚠ No s2s data, skipping graph 11")
         return
-    # Only successful probes
+    # Only successful probes (HTTP code 200, gRPC code 0)
     by_ts = defaultdict(lambda: {"connect": [], "queueing": []})
     for rec in s2s_records:
         code = rec.get("code")
-        if code is not None and int(code) != 200:
-            continue
+        if code is not None:
+            ok_code = 0 if rec.get("is_grpc") else 200
+            if int(code) != ok_code:
+                continue
         connect = rec.get("connect")
         ttfb    = rec.get("ttfb")
         ts      = rec.get("timestamp", "")
@@ -1062,8 +1086,10 @@ def plot_network_rtt_only(s2s_records, output_dir, from_loadgen_only=False):
     all_conns = []
     for rec in s2s_records:
         code = rec.get("code")
-        if code is not None and int(code) != 200:
-            continue
+        if code is not None:
+            ok_code = 0 if rec.get("is_grpc") else 200
+            if int(code) != ok_code:
+                continue
         c  = rec.get("connect")
         ts = rec.get("timestamp", "")
         if c is not None and c >= 0 and ts:

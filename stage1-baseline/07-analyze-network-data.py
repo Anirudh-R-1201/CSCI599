@@ -260,7 +260,7 @@ def parse_probe_kv(raw: str) -> dict:
         if "=" not in token:
             continue
         k, v = token.split("=", 1)
-        if k == "code":
+        if k in ("code", "grpc"):
             try:
                 out[k] = int(v)
             except Exception:
@@ -300,6 +300,8 @@ def load_service_to_service(network_dir: Path, service_to_nodes: Dict[str, Set[s
 
         if metrics.get("code") is not None:
             path_stats[path]["code"].append(float(metrics["code"]))
+        if metrics.get("grpc"):
+            path_stats[path]["grpc"].append(1)
         for metric in ("dns", "connect", "ttfb", "total"):
             if metric in metrics:
                 path_stats[path][metric].append(metrics[metric])
@@ -309,9 +311,14 @@ def load_service_to_service(network_dir: Path, service_to_nodes: Dict[str, Set[s
 
         target_nodes = service_to_nodes.get(target_service, set())
         if source_node and target_nodes:
-            all_total += 1
-            if source_node in target_nodes:
-                same_node_total += 1
+            # Only count successful probes toward intra-node ratio
+            code = metrics.get("code")
+            is_grpc = bool(metrics.get("grpc"))
+            ok_code = 0 if is_grpc else 200
+            if code is None or int(code) == ok_code:
+                all_total += 1
+                if source_node in target_nodes:
+                    same_node_total += 1
 
     summary = {}
     total_samples = 0
@@ -326,20 +333,31 @@ def load_service_to_service(network_dir: Path, service_to_nodes: Dict[str, Set[s
             t - c for t, c in zip(ttfb_list, connect_list)
             if t is not None and c is not None
         ]
+        # Determine if this path uses gRPC probes (majority vote across samples)
+        grpc_flags = metrics.get("grpc", [])
+        is_grpc_path = len(grpc_flags) > len(totals) / 2
+        code_list = metrics.get("code", [])
+        if code_list:
+            if is_grpc_path:
+                # gRPC: success = code 0 (OK); any non-zero code is an error
+                n_err = len([c for c in code_list if int(c) != 0])
+            else:
+                # HTTP: success = 2xx; curl timeout shows as code 0 (treated as error too)
+                n_err = len([c for c in code_list if int(c) not in (200, 201, 204)])
+            err_rate = n_err / len(code_list)
+        else:
+            err_rate = None
         summary[path] = {
             "samples": len(totals),
+            "is_grpc": is_grpc_path,
             "total_avg_ms": safe_mean(totals),
             "total_p95_ms": percentile(totals, 95),
             "total_p99_ms": percentile(totals, 99),
-            "dns_avg_ms": safe_mean(metrics.get("dns", [])),
-            "connect_avg_ms": safe_mean(connect_list),
-            "ttfb_avg_ms": safe_mean(ttfb_list),
-            "queueing_avg_ms": safe_mean(queueing_list) if queueing_list else None,
-            "error_rate": (
-                len([c for c in metrics.get("code", []) if int(c) >= 400]) / len(metrics.get("code", []))
-                if metrics.get("code")
-                else None
-            ),
+            "dns_avg_ms": safe_mean(metrics.get("dns", [])) if not is_grpc_path else None,
+            "connect_avg_ms": safe_mean(connect_list) if not is_grpc_path else None,
+            "ttfb_avg_ms": safe_mean(ttfb_list) if not is_grpc_path else None,
+            "queueing_avg_ms": safe_mean(queueing_list) if queueing_list and not is_grpc_path else None,
+            "error_rate": err_rate,
         }
 
     node_pair_summary = {}
