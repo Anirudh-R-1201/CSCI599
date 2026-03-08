@@ -76,7 +76,15 @@ def load_pod_snapshots(network_dir: Path) -> List[dict]:
 
 
 def load_service_endpoint_nodes(network_dir: Path) -> Dict[str, Set[str]]:
+    """Build service → set-of-nodes map.
+
+    Preferred source: service-endpoints-*.json (kubectl get endpoints -o json).
+    Fallback: pod-network-*.json (kubectl get pods -o json) using pod labels.
+    Also reads baseline/pods.json when available for the initial snapshot.
+    """
     service_to_nodes: Dict[str, Set[str]] = defaultdict(set)
+
+    # --- primary: service-endpoints snapshots ---
     for p in sorted(network_dir.glob("service-endpoints-*.json")):
         payload = load_json(p)
         if not payload:
@@ -88,6 +96,30 @@ def load_service_endpoint_nodes(network_dir: Path) -> Dict[str, Set[str]]:
                     node_name = addr.get("nodeName")
                     if node_name:
                         service_to_nodes[service_name].add(node_name)
+
+    # --- fallback: pod-network snapshots (pod list with nodeName + app label) ---
+    pod_sources = list(sorted(network_dir.glob("pod-network-*.json")))
+    # Also try baseline/pods.json one directory up
+    baseline_pods = network_dir.parent / "baseline" / "pods.json"
+    if baseline_pods.exists():
+        pod_sources.insert(0, baseline_pods)
+
+    if not service_to_nodes and pod_sources:
+        for p in pod_sources:
+            payload = load_json(p)
+            if not payload:
+                continue
+            for item in payload.get("items", []):
+                ns = (item.get("metadata") or {}).get("namespace", "")
+                if ns not in ("", "default"):
+                    continue
+                labels = (item.get("metadata") or {}).get("labels", {})
+                app = labels.get("app") or labels.get("app.kubernetes.io/name")
+                node = (item.get("spec") or {}).get("nodeName")
+                phase = (item.get("status") or {}).get("phase", "")
+                if app and node and phase == "Running":
+                    service_to_nodes[app].add(node)
+
     return service_to_nodes
 
 

@@ -216,9 +216,15 @@ def load_s2s_data(data_dir):
 
 
 def load_service_endpoint_nodes(data_dir):
-    """Return {service_name: set(node_names)} from service-endpoints-*.json."""
+    """Return {service_name: set(node_names)}.
+
+    Preferred: service-endpoints-*.json (kubectl get endpoints).
+    Fallback:  pod-network-*.json + baseline/pods.json (kubectl get pods).
+    """
     network_dir = os.path.join(data_dir, "network-analysis")
     svc_nodes = defaultdict(set)
+
+    # --- primary: endpoint snapshots ---
     for path in sorted(glob.glob(os.path.join(network_dir, "service-endpoints-*.json"))):
         try:
             with open(path) as f:
@@ -232,6 +238,30 @@ def load_service_endpoint_nodes(data_dir):
                     node = addr.get("nodeName")
                     if node:
                         svc_nodes[svc].add(node)
+
+    # --- fallback: pod-network snapshots + baseline pods.json ---
+    if not svc_nodes:
+        pod_sources = sorted(glob.glob(os.path.join(network_dir, "pod-network-*.json")))
+        baseline_pods = os.path.join(data_dir, "baseline", "pods.json")
+        if os.path.exists(baseline_pods):
+            pod_sources = [baseline_pods] + pod_sources
+        for path in pod_sources:
+            try:
+                with open(path) as f:
+                    payload = json.load(f)
+            except Exception:
+                continue
+            for item in payload.get("items", []):
+                ns = (item.get("metadata") or {}).get("namespace", "")
+                if ns not in ("", "default"):
+                    continue
+                labels = (item.get("metadata") or {}).get("labels", {})
+                app = labels.get("app") or labels.get("app.kubernetes.io/name")
+                node = (item.get("spec") or {}).get("nodeName")
+                phase = (item.get("status") or {}).get("phase", "")
+                if app and node and phase == "Running":
+                    svc_nodes[app].add(node)
+
     return {k: v for k, v in svc_nodes.items()}
 
 
