@@ -292,50 +292,24 @@ def _save(fig, output_dir, filename):
 # ---------------------------------------------------------------------------
 
 def plot_qps_comparison(bursts, output_dir, bursts_config=None):
-    """Bar chart: actual QPS per burst, bars colored by endpoint (cart/home/product).
-    Overlays configured QPS from bursts.jsonl when available.
-    """
-    # Group by endpoint
-    by_endpoint = defaultdict(list)
+    """Bar chart: actual QPS per burst (total across all endpoints per burst index)."""
+    # Sum actual_qps across all endpoints for each burst index
+    by_index = defaultdict(float)
     for b in bursts:
-        by_endpoint[b["endpoint"]].append(b)
+        by_index[b["index"]] += b["actual_qps"]
 
-    endpoints = [e for e in ENDPOINT_ORDER if e in by_endpoint]
-    if not endpoints:
-        endpoints = sorted(by_endpoint.keys())
-
-    # All burst indices (some may appear once per endpoint)
-    all_indices = sorted({b["index"] for b in bursts})
+    all_indices = sorted(by_index.keys())
     x = np.arange(len(all_indices))
-    n_ep = len(endpoints)
-    width = 0.8 / max(n_ep, 1)
+    vals = [by_index[i] for i in all_indices]
 
-    fig, ax = plt.subplots(figsize=(max(12, len(all_indices) * 0.55), 5))
-
-    for k, ep in enumerate(endpoints):
-        ep_map = {b["index"]: b["actual_qps"] for b in by_endpoint[ep]}
-        vals = [ep_map.get(i, 0) for i in all_indices]
-        offset = (k - (n_ep - 1) / 2) * width
-        ax.bar(x + offset, vals, width=width,
-               color=ENDPOINT_COLORS.get(ep, "#888888"), alpha=0.85, label=ep)
-
-    # Configured QPS overlay (per burst index, divided by n_endpoints as rough per-endpoint share)
-    if bursts_config:
-        cfg_map = {r["burst_index"]: r.get("total_qps", 0) / max(n_ep, 1) for r in bursts_config}
-        cfg_vals = [cfg_map.get(i, None) for i in all_indices]
-        valid = [(x[j], cfg_vals[j]) for j in range(len(all_indices)) if cfg_vals[j] is not None]
-        if valid:
-            xs, ys = zip(*valid)
-            ax.plot(xs, ys, 'k--', linewidth=1.5, label="Configured QPS / endpoint", alpha=0.6)
+    fig, ax = plt.subplots(figsize=(14, 6))
+    ax.bar(x, vals, alpha=0.8, color="#4393c3", label="Actual QPS")
 
     ax.set_xlabel("Burst index", fontsize=12)
     ax.set_ylabel("Queries per second (QPS)", fontsize=12)
-    ax.set_title("1. Load: actual QPS per burst, by endpoint\n"
-                 "(Dashed line = configured QPS ÷ endpoints — gap shows cluster capacity limit)",
-                 fontsize=13, fontweight="bold")
-    ax.set_xticks(x)
-    ax.set_xticklabels([str(i) for i in all_indices], fontsize=8)
-    ax.legend(loc="upper left", fontsize=10)
+    ax.set_title("1. Load: actual QPS per burst", fontsize=14, fontweight="bold")
+    ax.set_xticks(x[::2])
+    ax.set_xticklabels([str(all_indices[i]) for i in range(0, len(all_indices), 2)])
     ax.grid(True, alpha=0.3, axis="y")
     plt.tight_layout()
     _save(fig, output_dir, "01_qps_comparison.png")
@@ -417,37 +391,22 @@ def plot_latency_percentiles(bursts, output_dir):
 # ---------------------------------------------------------------------------
 
 def plot_latency_vs_qps(bursts, output_dir):
-    """Scatter: latency vs actual QPS, colored by warm-up (orange) vs steady-state (blue).
-    The negative correlation in warm-up is an HPA artifact, not a true load effect.
-    """
-    warmup_end = detect_warmup_burst(bursts)
+    """Scatter: latency (p50/p95/p99) vs actual QPS, colored by percentile."""
+    qps  = [b["actual_qps"]   for b in bursts]
+    p50  = [b["p50"]  * 1000  for b in bursts]
+    p95  = [b["p95"]  * 1000  for b in bursts]
+    p99  = [b["p99"]  * 1000  for b in bursts]
 
-    fig, ax = plt.subplots(figsize=(11, 6))
-
-    for phase, label, color, marker in [
-        ("warmup",  f"Warm-up phase (bursts 0–{warmup_end-1})", "#e65100", "^"),
-        ("steady",  f"Steady-state (bursts {warmup_end}+)",       "#2166ac", "o"),
-    ]:
-        qps, p95, p99 = [], [], []
-        for b in bursts:
-            is_warmup = b["index"] < warmup_end
-            if (phase == "warmup" and is_warmup) or (phase == "steady" and not is_warmup):
-                qps.append(b["actual_qps"])
-                p95.append(b["p95"] * 1000)
-                p99.append(b["p99"] * 1000)
-        if qps:
-            ax.scatter(qps, p95, alpha=0.75, s=55, color=color, marker=marker,
-                       label=f"{label} — p95")
-            ax.scatter(qps, p99, alpha=0.45, s=35, color=color, marker="x",
-                       label=f"{label} — p99")
+    fig, ax = plt.subplots(figsize=(10, 6))
+    ax.scatter(qps, p50, alpha=0.7, s=60, label="p50", marker="o", color="#4393c3")
+    ax.scatter(qps, p95, alpha=0.7, s=60, label="p95", marker="s", color="#d6604d")
+    ax.scatter(qps, p99, alpha=0.7, s=60, label="p99", marker="^", color="#4dac26")
 
     ax.set_xlabel("Actual QPS", fontsize=12)
     ax.set_ylabel("Latency (ms)", fontsize=12)
-    ax.set_title("3. Latency vs load: warm-up phase vs steady-state\n"
-                 "(Apparent negative slope in warm-up is an HPA scaling artifact, "
-                 "not a true load effect — filter to steady-state only for analysis)",
-                 fontsize=12, fontweight="bold")
-    ax.legend(loc="upper right", fontsize=9)
+    ax.set_title("3. Latency vs load: does higher QPS increase latency?",
+                 fontsize=14, fontweight="bold")
+    ax.legend(loc="best", fontsize=10)
     ax.grid(True, alpha=0.3)
     plt.tight_layout()
     _save(fig, output_dir, "03_latency_vs_qps.png")
@@ -504,8 +463,7 @@ def plot_pod_distribution(snapshots, output_dir):
 # ---------------------------------------------------------------------------
 
 def plot_service_placement(placement, output_dir):
-    """Heatmap: service × node pod counts, with call graph edges showing
-    cross-node (red) vs potentially same-node (green) call paths."""
+    """Heatmap: service × node pod counts (average over all snapshots)."""
     spread = (placement.get("service_node_spread_avg") or
               placement.get("service_node_spread")) if placement else None
     if not spread:
@@ -530,25 +488,19 @@ def plot_service_placement(placement, output_dir):
         print("⚠ No placement matrix data, skipping graph 05")
         return
 
-    # ---- figure: heatmap on top, call-graph co-location legend below ----
-    fig = plt.figure(figsize=(max(9, len(nodes) * 1.6), max(8, len(services) * 0.45) + 3))
-    ax_heat = fig.add_axes([0.15, 0.30, 0.72, 0.65])
-    ax_legend = fig.add_axes([0.02, 0.00, 0.96, 0.26])
+    fig, ax = plt.subplots(figsize=(max(9, len(nodes) * 1.6), max(6, len(services) * 0.55)))
 
     vmax = max(max(r) for r in data) or 1
-    im = ax_heat.imshow(data, cmap="Blues", aspect="auto", vmin=0, vmax=vmax)
-    ax_heat.set_xticks(range(len(nodes)))
-    ax_heat.set_xticklabels(node_labels, rotation=45, ha="right")
-    ax_heat.set_yticks(range(len(services)))
-    ax_heat.set_yticklabels(services, fontsize=9)
-    ax_heat.set_xlabel("Node", fontsize=11)
-    ax_heat.set_ylabel("Service", fontsize=11)
-    ax_heat.set_title("5. Placement: service pods per node  (avg over all snapshots)\n"
-                      "Call graph below: green = co-located on same node possible, "
-                      "red = always cross-node",
-                      fontsize=12, fontweight="bold")
-    plt.colorbar(im, ax=ax_heat,
-                 label="Pod count (avg over snapshots)", fraction=0.03, pad=0.02)
+    im = ax.imshow(data, cmap="Blues", aspect="auto", vmin=0, vmax=vmax)
+    ax.set_xticks(range(len(nodes)))
+    ax.set_xticklabels(node_labels, rotation=45, ha="right")
+    ax.set_yticks(range(len(services)))
+    ax.set_yticklabels(services, fontsize=9)
+    ax.set_xlabel("Node", fontsize=11)
+    ax.set_ylabel("Service", fontsize=11)
+    ax.set_title("5. Placement: which service's pods are on which node (average over all snapshots)",
+                 fontsize=12, fontweight="bold")
+    plt.colorbar(im, ax=ax, label="Pod count (average over all snapshots)", fraction=0.03, pad=0.02)
 
     for i in range(len(services)):
         for j in range(len(nodes)):
@@ -556,59 +508,10 @@ def plot_service_placement(placement, output_dir):
             if v > 0:
                 label = (f"{v:.1f}" if use_avg and isinstance(v, float) and v != int(v)
                          else str(int(round(v))))
-                ax_heat.text(j, i, label, ha="center", va="center",
-                             color="white" if v >= vmax / 2 else "black", fontsize=9)
+                ax.text(j, i, label, ha="center", va="center",
+                        color="white" if v >= vmax / 2 else "black", fontsize=9)
 
-    # Overlay arrows for call graph edges on the LEFT margin
-    svc_row = {s: i for i, s in enumerate(services)}
-    arrow_props = dict(arrowstyle="->", lw=1.2, connectionstyle="arc3,rad=0.3")
-    for caller, callees in BOUTIQUE_CALL_GRAPH.items():
-        if caller not in svc_row:
-            continue
-        for callee in callees:
-            if callee not in svc_row:
-                continue
-            caller_nodes = set(spread.get(caller, {}).get("nodes_used", []))
-            callee_nodes = set(spread.get(callee, {}).get("nodes_used", []))
-            co_located = bool(caller_nodes & callee_nodes)
-            color = "#2ca02c" if co_located else "#d62728"
-            y0 = svc_row[caller]
-            y1 = svc_row[callee]
-            ax_heat.annotate("",
-                xy=(-0.7, y1), xytext=(-0.7, y0),
-                xycoords="data", textcoords="data",
-                arrowprops={**arrow_props, "color": color},
-                annotation_clip=False)
-
-    # Call-graph summary table
-    ax_legend.axis("off")
-    lines = []
-    for caller, callees in BOUTIQUE_CALL_GRAPH.items():
-        for callee in callees:
-            caller_nodes = set(spread.get(caller, {}).get("nodes_used", []))
-            callee_nodes = set(spread.get(callee, {}).get("nodes_used", []))
-            co = bool(caller_nodes & callee_nodes)
-            label = "same-node possible" if co else "ALWAYS CROSS-NODE"
-            color = "#2ca02c" if co else "#d62728"
-            lines.append((f"{caller} → {callee}", label, color))
-
-    n_cols = 3
-    col_width = 1.0 / n_cols
-    for idx, (edge, label, color) in enumerate(lines):
-        col = idx % n_cols
-        row = idx // n_cols
-        x_pos = col * col_width + 0.01
-        y_pos = 0.92 - row * 0.22
-        ax_legend.text(x_pos, y_pos, f"{edge}:  ", ha="left", va="top",
-                       fontsize=8.5, transform=ax_legend.transAxes)
-        ax_legend.text(x_pos + 0.16, y_pos, label, ha="left", va="top",
-                       fontsize=8.5, color=color, fontweight="bold",
-                       transform=ax_legend.transAxes)
-
-    ax_legend.set_title("Call graph co-location status  "
-                        "(green = caller & callee share a node, red = always cross-node)",
-                        fontsize=10, loc="left", pad=4)
-
+    plt.tight_layout()
     _save(fig, output_dir, "05_service_placement_by_node.png")
 
 
@@ -707,6 +610,8 @@ def plot_cross_node_ratio(s2s_records, service_to_nodes, output_dir, from_loadge
     if from_loadgen_only:
         title += " (from load generator — deploy s2s-prober for per-service view)"
 
+    all_zero = all(r == 0 for r in ratios)
+
     fig, ax = plt.subplots(figsize=(max(10, len(pairs) * 0.6), 6))
     ax.bar(range(len(pairs)), ratios, color=colors, alpha=0.88)
     ax.axhline(50, color="red", linestyle="--", linewidth=1, alpha=0.5, label="50% threshold")
@@ -719,6 +624,16 @@ def plot_cross_node_ratio(s2s_records, service_to_nodes, output_dir, from_loadge
                  fontsize=13, fontweight="bold")
     ax.legend(fontsize=10)
     ax.grid(True, alpha=0.3, axis="y")
+
+    if all_zero:
+        ax.text(0.5, 0.55,
+                "All 0%: prober is co-located with target service nodes.\n"
+                "Cross-node detection requires probe source ≠ all target nodes.\n"
+                "→ Only frontend probed; frontend has pods on every node.",
+                ha="center", va="center", transform=ax.transAxes, fontsize=10,
+                color="#8b0000",
+                bbox=dict(boxstyle="round,pad=0.5", fc="#fff8f8", ec="#d73027", alpha=0.85))
+
     plt.tight_layout()
     _save(fig, output_dir, "07_cross_node_ratio.png")
 
@@ -776,6 +691,17 @@ def plot_same_vs_cross_node_cdf(s2s_records, service_to_nodes, output_dir, from_
                  fontsize=12, fontweight="bold")
     ax.legend(fontsize=11)
     ax.grid(True, alpha=0.3)
+
+    if not cross_node:
+        ax.text(0.5, 0.40,
+                "No cross-node data in this run.\n"
+                "Prober is co-located with all probed services\n"
+                "(frontend has pods on every node).\n"
+                "→ Expand probing to backend-only nodes for comparison.",
+                ha="center", va="center", transform=ax.transAxes, fontsize=10,
+                color="#7b3f00",
+                bbox=dict(boxstyle="round,pad=0.5", fc="#fffbe6", ec="#e67e22", alpha=0.85))
+
     plt.tight_layout()
     _save(fig, output_dir, "08_same_vs_cross_node_cdf.png")
 
@@ -1058,18 +984,24 @@ def plot_queueing_vs_rtt(s2s_records, output_dir, from_loadgen_only=False):
     title = "11. Decomposition: network RTT vs server queueing delay over time"
     title += " (load generator)" if from_loadgen_only else " (client prober → service)"
 
+    # Clamp zeros to a small positive value so log scale works on stackplot
+    eps = 0.01
+    mean_connect_log  = [max(v, eps) for v in mean_connect]
+    mean_queueing_log = [max(v, eps) for v in mean_queueing]
+
     fig, ax = plt.subplots(figsize=(14, 6))
-    ax.stackplot(x, mean_connect, mean_queueing,
+    ax.stackplot(x, mean_connect_log, mean_queueing_log,
                  labels=["Network RTT (connect, includes DNS)",
                          "Server queueing delay (ttfb − connect)"],
                  colors=["#4393c3", "#d6604d"], alpha=0.85)
+    ax.set_yscale("log")
     ax.set_xlabel("Probe snapshot (time order)", fontsize=12)
-    ax.set_ylabel("Latency (ms)", fontsize=12)
+    ax.set_ylabel("Latency (ms, log scale)", fontsize=12)
     ax.set_title(title + "\n(Note: 'connect' time includes CoreDNS resolution — "
                  "pure TCP RTT is sub-ms; queueing dominates under load)",
                  fontsize=12, fontweight="bold")
     ax.legend(loc="upper left", fontsize=10)
-    ax.grid(True, alpha=0.3, axis="y")
+    ax.grid(True, alpha=0.3, which="both", axis="y")
     plt.tight_layout()
     _save(fig, output_dir, "11_queueing_vs_rtt.png")
 
@@ -1260,10 +1192,10 @@ def plot_hpa_latency_timeline(bursts, latency_replicas_rows, output_dir):
                 hpa_ceil_idx = i
                 break
 
-    fig, ax1 = plt.subplots(figsize=(14, 6))
-    ax2 = ax1.twinx()
+    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(14, 9),
+                                    gridspec_kw={"height_ratios": [1.6, 1]})
 
-    # Latency lines
+    # ── Top panel: per-endpoint p95 latency vs burst index ──────────────────
     for ep in endpoints:
         idx_map = by_ep[ep]
         idx_list = sorted(idx_map)
@@ -1271,31 +1203,34 @@ def plot_hpa_latency_timeline(bursts, latency_replicas_rows, output_dir):
         ax1.plot(idx_list, vals, "o-", color=ENDPOINT_COLORS.get(ep, "#444"),
                  linewidth=2, markersize=5, label=f"/{ep} p95")
 
-    # HPA replica bars on right axis
+    ax1.set_ylabel("p95 latency (ms)", fontsize=12)
+    ax1.set_xlabel("Burst index", fontsize=11)
+    ax1.set_title("13. HPA scaling vs end-to-end latency\n"
+                  "Top: per-endpoint p95 latency over bursts   "
+                  "Bottom: total running replicas over HPA snapshots",
+                  fontsize=13, fontweight="bold")
+    ax1.legend(loc="upper right", fontsize=10)
+    ax1.grid(True, alpha=0.3)
+
+    # ── Bottom panel: HPA total replicas vs snapshot index ──────────────────
     if hpa_total:
-        hpa_x = range(len(hpa_total))
-        ax2.bar(hpa_x, hpa_total, color="#aaaaaa", alpha=0.3, width=0.9, zorder=0,
+        hpa_x = np.arange(len(hpa_total))
+        ax2.bar(hpa_x, hpa_total, color="#aaaaaa", alpha=0.55, width=1.0,
                 label="Total replicas (HPA)")
-        ax2.set_ylabel("Total running replicas", fontsize=11, color="#888")
-        ax2.tick_params(axis="y", colors="#888")
+        ax2.set_ylabel("Total running replicas", fontsize=11)
+        ax2.set_xlabel("HPA snapshot index (collected every ~8 s)", fontsize=11)
         if hpa_ceil_idx is not None:
             ax2.axvline(hpa_ceil_idx, color="#e65100", linewidth=1.5,
-                        linestyle=":", alpha=0.8)
-            ax2.text(hpa_ceil_idx + 0.2, max(hpa_total) * 0.95,
-                     f"HPA ceiling\n({max_rep} replicas)", fontsize=8, color="#e65100")
+                        linestyle=":", alpha=0.9)
+            ax2.text(hpa_ceil_idx + 0.5, max(hpa_total) * 0.92,
+                     f"HPA ceiling\n({max_rep} replicas)",
+                     fontsize=8, color="#e65100")
+        ax2.legend(loc="upper right", fontsize=10)
+        ax2.grid(True, alpha=0.3, axis="y")
+    else:
+        ax2.text(0.5, 0.5, "No HPA snapshot data", ha="center", va="center",
+                 transform=ax2.transAxes, fontsize=12, color="#888")
 
-    ax1.set_xlabel("Burst / snapshot index", fontsize=12)
-    ax1.set_ylabel("p95 latency (ms)", fontsize=12)
-    ax1.set_title("13. HPA scaling vs end-to-end latency over time\n"
-                  "(Grey bars = total running replicas; coloured lines = p95 per endpoint; "
-                  "orange dotted = HPA ceiling reached)",
-                  fontsize=13, fontweight="bold")
-    lines1, labels1 = ax1.get_legend_handles_labels()
-    lines2, labels2 = ax2.get_legend_handles_labels()
-    ax1.legend(lines1 + lines2, labels1 + labels2, loc="upper right", fontsize=10)
-    ax1.grid(True, alpha=0.3, zorder=2)
-    ax1.set_zorder(ax2.get_zorder() + 1)
-    ax1.patch.set_visible(False)
     plt.tight_layout()
     _save(fig, output_dir, "13_hpa_latency_timeline.png")
 
@@ -1503,8 +1438,10 @@ def main():
     _plot("08", plot_same_vs_cross_node_cdf,    s2s_for_net, service_to_nodes, output_dir, from_loadgen_only=from_lg_only)
     _plot("09", plot_p95_vs_replicas,           latency_rows, output_dir)
     _plot("09b", plot_p95_vs_node_count,        latency_rows, output_dir)
-    _plot("10", plot_node_pair_heatmap,         s2s_for_net, output_dir, from_loadgen_only=from_lg_only)
-    _plot("10b", plot_latency_to_service_by_node, s2s_for_net, output_dir, from_loadgen_only=from_lg_only)
+    # Graphs 10 and 10b only provide value when probes come from multiple source nodes;
+    # they are skipped by default. Uncomment below to re-enable.
+    # _plot("10", plot_node_pair_heatmap,         s2s_for_net, output_dir, from_loadgen_only=from_lg_only)
+    # _plot("10b", plot_latency_to_service_by_node, s2s_for_net, output_dir, from_loadgen_only=from_lg_only)
     _plot("11", plot_queueing_vs_rtt,           s2s_for_net, output_dir, from_loadgen_only=from_lg_only)
     _plot("11b", plot_network_rtt_only,         s2s_for_net, output_dir, from_loadgen_only=from_lg_only)
 
@@ -1517,24 +1454,23 @@ def main():
     readme = os.path.join(output_dir, "README.txt")
     with open(readme, "w") as f:
         f.write("Experiment graphs — view in story order:\n\n")
-        f.write("  01_qps_comparison.png             – Actual QPS per burst, coloured by endpoint (+ configured QPS line)\n")
+        f.write("  01_qps_comparison.png             – Actual QPS per burst\n")
         f.write("  02_latency_percentiles.png         – p50/p95/p99 per endpoint over time (warm-up phase annotated)\n")
-        f.write("  03_latency_vs_qps.png              – Latency vs QPS scatter, warm-up phase vs steady-state\n")
+        f.write("  03_latency_vs_qps.png              – Latency vs QPS scatter (p50/p95/p99)\n")
         f.write("  04_pod_distribution.png            – Pod count per node over time + imbalance ratio\n")
-        f.write("  05_service_placement_by_node.png   – Service placement heatmap + call graph co-location overlay\n")
+        f.write("  05_service_placement_by_node.png   – Service placement heatmap (avg pods per node)\n")
         f.write("  06_latency_distribution.png        – Latency boxplots split by endpoint (cart/home/product)\n")
-        f.write("  13_hpa_latency_timeline.png        – Dual-axis: HPA replica count + per-endpoint p95 over time\n")
+        f.write("  13_hpa_latency_timeline.png        – HPA replica count (bottom) + per-endpoint p95 (top) over time\n")
         f.write("  14_per_endpoint_latency.png        – Grouped boxplot comparing /cart /home /product latency\n\n")
         f.write("  Network graphs (require s2s probe data):\n")
         f.write("  07_cross_node_ratio.png            – % of calls that crossed a node per service pair\n")
         f.write("  08_same_vs_cross_node_cdf.png      – Latency CDF: same-node vs cross-node calls\n")
         f.write("  09_p95_vs_replicas.png             – p95 latency vs total running replicas\n")
         f.write("  09b_p95_vs_node_count.png          – p95 latency vs pod spread across nodes\n")
-        f.write("  10_node_pair_latency_heatmap.png   – p95 heatmap: source node × target service\n")
-        f.write("  10b_latency_to_service_by_node.png – p95 to each service by node (gRPC panels annotated)\n")
-        f.write("  11_queueing_vs_rtt.png             – Decomposition: network RTT vs server queueing delay\n")
+        f.write("  11_queueing_vs_rtt.png             – Decomposition: network RTT vs server queueing delay (log scale)\n")
         f.write("  11b_network_rtt_only.png           – Connect-time time-series + CDF (bimodal split)\n")
         f.write("  12_connect_time_cdf.png            – Connection-time distribution: fast (<5ms) vs slow (DNS)\n\n")
+        f.write("  (Graphs 10/10b skipped: only useful when probes come from multiple source nodes)\n\n")
         f.write("  summary_stats.txt                  – Numeric summary\n")
     print(f"✓ Generated: {readme}")
     print(f"\n✓ All graphs written to: {output_dir}")

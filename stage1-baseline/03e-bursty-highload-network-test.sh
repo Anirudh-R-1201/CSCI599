@@ -66,6 +66,36 @@ else
 fi
 export S2S_SOURCE_POD
 
+# ── gRPC pre-flight check ─────────────────────────────────────────────────────
+# Verify that fortio can run a gRPC probe and produce JSON on stdout.
+# Stderr is captured separately so log noise doesn't break JSON parsing.
+echo "Running gRPC pre-flight check (fortio-loadgen → productcatalogservice:3550)..."
+_pf_err_file="/tmp/grpc-preflight-err-$$"
+grpc_preflight_json=$(kubectl --kubeconfig "${KUBECONFIG_PATH}" exec fortio-loadgen -- \
+  fortio load -grpc -c 1 -n 1 -qps 0 -json - productcatalogservice:3550 \
+  2>"${_pf_err_file}" || true)
+grpc_preflight_ok=$(echo "${grpc_preflight_json}" | python3 -c "
+import json, sys
+try:
+    d = json.load(sys.stdin)
+    codes = d.get('RetCodes') or {}
+    print('ok:' + str(codes))
+except Exception as e:
+    print('fail:' + str(e))
+" 2>/dev/null || echo "fail:python-error")
+if [[ "${grpc_preflight_ok}" == ok:* ]]; then
+  echo "  gRPC pre-flight passed: ${grpc_preflight_ok}"
+  GRPC_PROBE_ENABLED=1
+else
+  echo "  ⚠ gRPC pre-flight FAILED: ${grpc_preflight_ok}"
+  echo "  stderr: $(cat "${_pf_err_file}" 2>/dev/null | head -3)"
+  echo "  stdout: $(echo "${grpc_preflight_json}" | head -3)"
+  echo "  → Falling back to HTTP-only s2s probes (gRPC services will show no data)."
+  GRPC_PROBE_ENABLED=0
+fi
+rm -f "${_pf_err_file}"
+export GRPC_PROBE_ENABLED
+
 # Map each service to its protocol and port.
 # HTTP services are probed via curl (fast timing breakdown: dns/connect/ttfb/total).
 # gRPC services are probed via fortio health check (total latency only).
@@ -137,18 +167,25 @@ probe_service_latencies() {
     for ((k=0; k<S2S_PROBE_REPEAT; k++)); do
       local probe source_pod source_node
 
-      if [ "${proto}" = "grpc" ]; then
+      if [ "${proto}" = "grpc" ] && [ "${GRPC_PROBE_ENABLED:-0}" = "1" ]; then
         # ── gRPC probe via fortio health check ──────────────────────────────
         # Uses the standard gRPC health check protocol (grpc.health.v1.Health/Check).
         # All Online Boutique gRPC services expose this endpoint (confirmed via K8s grpc probes).
-        # Output: dns=0 connect=0 ttfb=<p50_ms> total=<avg_ms> code=<grpc_code> grpc=1
+        # NOTE: Do NOT pass -grpc-health-svc "" — some fortio versions emit no JSON with that flag.
+        # Just -grpc alone invokes the health check with an empty (server-wide) service name.
         # gRPC codes: 0=OK, 2=UNKNOWN, 12=UNIMPLEMENTED, 14=UNAVAILABLE
         source_pod="${grpc_pod}"
         source_node="${grpc_node}"
-        local raw
+        local raw grpc_err_file
+        grpc_err_file="/tmp/grpc-err-${t}-${k}-$$"
         raw=$(kubectl --kubeconfig "${KUBECONFIG_PATH}" exec "${grpc_pod}" -- \
-          fortio load -grpc -grpc-health-svc "" \
-            -c 1 -n 1 -qps 0 -json - "${t}:${port}" 2>/dev/null || true)
+          fortio load -grpc \
+            -c 1 -n 1 -qps 0 -json - "${t}:${port}" \
+          2>"${grpc_err_file}" || true)
+        if [ -z "${raw}" ]; then
+          echo "⚠ gRPC probe empty for ${t}:${port} (stderr: $(cat "${grpc_err_file}" 2>/dev/null | head -1))" >&2
+        fi
+        rm -f "${grpc_err_file}"
         probe=$(echo "${raw}" | python3 -c "
 import json, sys
 try:
@@ -166,6 +203,10 @@ try:
 except Exception as e:
     sys.stderr.write('grpc-probe-parse-error: {}\n'.format(e))
 " 2>/dev/null || true)
+
+      elif [ "${proto}" = "grpc" ]; then
+        # gRPC probing disabled (pre-flight failed) — skip silently
+        probe=""
 
       elif [ "${http_pod}" = "fortio-loadgen" ]; then
         # ── HTTP probe via fortio (no curl available in fortio image) ────────
@@ -236,11 +277,12 @@ monitor_loop() {
 }
 
 : > "${S2S_FILE}"
+: > "${NET_DIR}/monitoring.log"
 echo "Starting telemetry monitoring in background (interval=${SAMPLE_INTERVAL}s)..."
-# One initial probe so we verify connectivity and have at least one sample if the loop fails
+# One initial probe — output goes to monitoring.log so errors are captured
 ts0="$(date +"%Y%m%d-%H%M%S")"
-( set +e; probe_service_latencies "${ts0}" "${TARGET_SERVICES_CSV}"; )
-monitor_loop > "${NET_DIR}/monitoring.log" 2>&1 &
+( set +e; probe_service_latencies "${ts0}" "${TARGET_SERVICES_CSV}"; ) >> "${NET_DIR}/monitoring.log" 2>&1
+monitor_loop >> "${NET_DIR}/monitoring.log" 2>&1 &
 MONITOR_PID=$!
 
 echo "Generating burst plan..."
