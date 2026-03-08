@@ -263,8 +263,11 @@ def parse_probe_kv(raw: str) -> dict:
         if k in ("code", "grpc"):
             try:
                 out[k] = int(v)
-            except Exception:
-                continue
+            except (ValueError, TypeError):
+                # gRPC string codes: 'SERVING'→0, 'NOT_SERVING'→2, etc.
+                _map = {"SERVING": 0, "OK": 0, "NOT_SERVING": 2,
+                        "UNKNOWN": 2, "SERVICE_UNKNOWN": 5, "UNAVAILABLE": 14}
+                out[k] = _map.get(str(v).upper(), 2)
         else:
             try:
                 # Probe string is written in ms (03e: curl s→ms; fortio: already ms)

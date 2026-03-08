@@ -79,7 +79,9 @@ import json, sys
 try:
     d = json.load(sys.stdin)
     codes = d.get('RetCodes') or {}
-    print('ok:' + str(codes))
+    # Accept both numeric 0 and string 'SERVING' as success
+    ok = any(str(k).upper() in ('0','SERVING','OK') for k in codes)
+    print('ok:' + str(codes) + (' [SERVING]' if ok else ' [FAILED]'))
 except Exception as e:
     print('fail:' + str(e))
 " 2>/dev/null || echo "fail:python-error")
@@ -188,6 +190,10 @@ probe_service_latencies() {
         rm -f "${grpc_err_file}"
         probe=$(echo "${raw}" | python3 -c "
 import json, sys
+# fortio gRPC RetCodes uses string keys like 'SERVING', 'NOT_SERVING', etc.
+# Map them to numeric gRPC status codes (0=OK, 2=UNKNOWN, 5=NOT_FOUND, 14=UNAVAILABLE)
+GRPC_CODE_MAP = {'SERVING': 0, 'NOT_SERVING': 2, 'SERVICE_UNKNOWN': 5,
+                 'UNKNOWN': 2, 'UNAVAILABLE': 14, 'OK': 0}
 try:
     d = json.load(sys.stdin)
     h = d.get('DurationHistogram') or {}
@@ -196,10 +202,14 @@ try:
             for p in h.get('Percentiles', []) if 'Percentile' in p and 'Value' in p}
     p50_ms = pcts.get(50.0, avg_ms)
     codes = d.get('RetCodes') or {}
-    # Pick the dominant response code (most frequent key in RetCodes)
-    code = sorted(codes.items(), key=lambda x: -x[1])[0][0] if codes else 0
+    # Dominant key — may be string ('SERVING') or numeric ('0')
+    raw_code = sorted(codes.items(), key=lambda x: -x[1])[0][0] if codes else 0
+    try:
+        numeric_code = int(raw_code)
+    except (ValueError, TypeError):
+        numeric_code = GRPC_CODE_MAP.get(str(raw_code).upper(), 2)
     print('dns=0 connect=0 ttfb={:.2f} total={:.2f} code={} grpc=1'.format(
-        p50_ms, avg_ms, int(code)))
+        p50_ms, avg_ms, numeric_code))
 except Exception as e:
     sys.stderr.write('grpc-probe-parse-error: {}\n'.format(e))
 " 2>/dev/null || true)
