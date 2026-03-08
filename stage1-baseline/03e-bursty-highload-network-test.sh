@@ -22,22 +22,28 @@ MAX_BURST_SECONDS="${MAX_BURST_SECONDS:-90}"
 MIN_SLEEP_SECONDS="${MIN_SLEEP_SECONDS:-45}"
 MAX_SLEEP_SECONDS="${MAX_SLEEP_SECONDS:-120}"
 THREADS_PER_ENDPOINT="${THREADS_PER_ENDPOINT:-12}"
+# Total QPS across all endpoints. Keep well below cluster saturation —
+# at ~160 QPS total the 5-node cluster is already heavily loaded.
+# Spikes go up to QPS_CEIL; heavy-tail baseline distributes around QPS_FLOOR.
 QPS_FLOOR="${QPS_FLOOR:-80}"
-QPS_CEIL="${QPS_CEIL:-500}"
+QPS_CEIL="${QPS_CEIL:-300}"
 SPIKE_PROBABILITY="${SPIKE_PROBABILITY:-0.35}"
 
-# Relative endpoint weights for generated total QPS.
-# Checkout exercises the deepest call chain (7 services, 2 hops) and is
-# the most important endpoint for east-west traffic measurement.
-WEIGHT_HOME="${WEIGHT_HOME:-0.30}"
-WEIGHT_PRODUCT="${WEIGHT_PRODUCT:-0.25}"
-WEIGHT_CART="${WEIGHT_CART:-0.20}"
-WEIGHT_CHECKOUT="${WEIGHT_CHECKOUT:-0.25}"
+# Relative endpoint weights.
+# Home/product/cart cover the shallow call chains (catalog, currency, recommendation).
+# Product detail page is the most reliable way to exercise productcatalogservice,
+# recommendationservice, and currencyservice without stateful side effects.
+# Checkout via fortio is stateless-hostile (empties cart on first call) so we
+# weight it low and rely on the product/cart paths for east-west coverage instead.
+WEIGHT_HOME="${WEIGHT_HOME:-0.35}"
+WEIGHT_PRODUCT="${WEIGHT_PRODUCT:-0.40}"
+WEIGHT_CART="${WEIGHT_CART:-0.25}"
+WEIGHT_CHECKOUT="${WEIGHT_CHECKOUT:-0.00}"
 
 # Export so inline Python (burst plan) can read them
 export BURSTS BASE_BURST_SECONDS MAX_BURST_SECONDS MIN_SLEEP_SECONDS MAX_SLEEP_SECONDS
 export QPS_FLOOR QPS_CEIL SPIKE_PROBABILITY
-export WEIGHT_HOME WEIGHT_PRODUCT WEIGHT_CART WEIGHT_CHECKOUT
+export WEIGHT_HOME WEIGHT_PRODUCT WEIGHT_CART
 
 # Monitoring settings.
 SAMPLE_INTERVAL="${SAMPLE_INTERVAL:-8}"
@@ -130,17 +136,11 @@ HOME_URL="http://frontend:80/"
 PRODUCT_URL="http://frontend:80/product/${PRODUCT_ID}"
 CART_URL="http://frontend:80/cart"
 
-# Pre-seed the cart so checkout requests have items to process.
-# This hits: frontend → cartservice → redis-cart (adds product once at startup).
-echo "Pre-seeding cart for checkout load..."
-kubectl --kubeconfig "${KUBECONFIG_PATH}" exec fortio-loadgen -- \
-  sh -c "curl -s -X POST http://frontend:80/cart \
-    -d 'product_id=${PRODUCT_ID}&quantity=1' -L" >/dev/null 2>&1 || true
-
-# Checkout URL: POST triggers the full deep call chain
-# frontend → checkoutservice → paymentservice + shippingservice + emailservice
-#           + currencyservice + cartservice + productcatalogservice (7 services)
-CHECKOUT_URL="http://frontend:80/cart/checkout"
+# NOTE: checkout (POST /cart/checkout) is NOT load-tested via fortio because it
+# empties the cart on each call, so only the first request exercises the full
+# checkoutservice fan-out; subsequent requests return "empty cart" errors.
+# The /product/:id path reliably exercises frontend→{productcatalog,currency,
+# recommendation} on every request and is the primary east-west driver here.
 
 capture_cluster_snapshot() {
   local timestamp="$1"
@@ -330,11 +330,10 @@ qps_ceil = int(os.environ["QPS_CEIL"])
 qps_floor, qps_ceil = min(qps_floor, qps_ceil), max(qps_floor, qps_ceil)
 spike_prob = float(os.environ["SPIKE_PROBABILITY"])
 
-w_home     = float(os.environ["WEIGHT_HOME"])
-w_prod     = float(os.environ["WEIGHT_PRODUCT"])
-w_cart     = float(os.environ["WEIGHT_CART"])
-w_checkout = float(os.environ["WEIGHT_CHECKOUT"])
-total_weight = w_home + w_prod + w_cart + w_checkout
+w_home = float(os.environ["WEIGHT_HOME"])
+w_prod = float(os.environ["WEIGHT_PRODUCT"])
+w_cart = float(os.environ["WEIGHT_CART"])
+total_weight = w_home + w_prod + w_cart
 
 random.seed(int(time.time()))
 
@@ -351,21 +350,19 @@ for i in range(bursts):
     duration = random.randint(min_dur, max_dur)
     sleep_s = random.randint(min_sleep, max_sleep)
 
-    q_home     = max(1, int(total_qps * (w_home     / total_weight)))
-    q_prod     = max(1, int(total_qps * (w_prod     / total_weight)))
-    q_checkout = max(1, int(total_qps * (w_checkout / total_weight)))
-    q_cart     = max(1, total_qps - q_home - q_prod - q_checkout)
+    q_home = max(1, int(total_qps * (w_home / total_weight)))
+    q_prod = max(1, int(total_qps * (w_prod / total_weight)))
+    q_cart = max(1, total_qps - q_home - q_prod)
 
     print(json.dumps({
-        "burst_index":  i,
-        "burst_type":   burst_type,
-        "total_qps":    total_qps,
-        "duration_s":   duration,
-        "sleep_s":      sleep_s,
-        "qps_home":     q_home,
-        "qps_product":  q_prod,
-        "qps_cart":     q_cart,
-        "qps_checkout": q_checkout
+        "burst_index": i,
+        "burst_type":  burst_type,
+        "total_qps":   total_qps,
+        "duration_s":  duration,
+        "sleep_s":     sleep_s,
+        "qps_home":    q_home,
+        "qps_product": q_prod,
+        "qps_cart":    q_cart
     }))
 PY
 
@@ -382,10 +379,9 @@ while IFS= read -r burst; do
   qps_home=$(echo "${burst}" | python3 -c 'import json,sys; print(json.load(sys.stdin)["qps_home"])')
   qps_product=$(echo "${burst}" | python3 -c 'import json,sys; print(json.load(sys.stdin)["qps_product"])')
   qps_cart=$(echo "${burst}" | python3 -c 'import json,sys; print(json.load(sys.stdin)["qps_cart"])')
-  qps_checkout=$(echo "${burst}" | python3 -c 'import json,sys; print(json.load(sys.stdin)["qps_checkout"])')
 
   echo "Burst ${idx} [${burst_type}] total_qps=${total_qps} duration=${duration_s}s sleep=${sleep_s}s"
-  echo "  split: home=${qps_home}, product=${qps_product}, cart=${qps_cart}, checkout=${qps_checkout}"
+  echo "  split: home=${qps_home}, product=${qps_product}, cart=${qps_cart}"
 
   kubectl --kubeconfig "${KUBECONFIG_PATH}" exec fortio-loadgen -- \
     fortio load -qps "${qps_home}" -c "${THREADS_PER_ENDPOINT}" -t "${duration_s}s" \
@@ -408,20 +404,7 @@ while IFS= read -r burst; do
     > "${LOAD_DIR}/fortio-burst-${idx}-cart.json" 2> "${LOAD_DIR}/fortio-burst-${idx}-cart.log" &
   p3=$!
 
-  # Checkout: POST with prefilled form data — exercises the deepest service call chain
-  # frontend → checkoutservice → {paymentservice, shippingservice, emailservice,
-  #            currencyservice, cartservice, productcatalogservice}
-  kubectl --kubeconfig "${KUBECONFIG_PATH}" exec fortio-loadgen -- \
-    fortio load -qps "${qps_checkout}" -c "${THREADS_PER_ENDPOINT}" -t "${duration_s}s" \
-    -p "50,90,95,99,99.9" -abort-on -1 -allow-initial-errors -json - \
-    -labels "burst-${idx}-checkout-${burst_type}" \
-    -X POST \
-    -payload "email=test@example.com&street_address=123+Main+St&zip_code=10001&city=New+York&state=NY&country=US&credit_card_number=4432801561520454&credit_card_expiration_month=1&credit_card_expiration_year=2030&credit_card_cvv=672" \
-    "${CHECKOUT_URL}" \
-    > "${LOAD_DIR}/fortio-burst-${idx}-checkout.json" 2> "${LOAD_DIR}/fortio-burst-${idx}-checkout.log" &
-  p4=$!
-
-  wait "${p1}" "${p2}" "${p3}" "${p4}"
+  wait "${p1}" "${p2}" "${p3}"
 
   # Additional immediate sample right after each burst.
   capture_cluster_snapshot "$(date +"%Y%m%d-%H%M%S")"
