@@ -595,75 +595,123 @@ def plot_latency_distribution(bursts, output_dir):
 # Graph 07 – Cross-node call ratio
 # ---------------------------------------------------------------------------
 
-def plot_cross_node_ratio(s2s_records, service_to_nodes, output_dir, from_loadgen_only=False):
-    if not s2s_records:
-        print("⚠ No s2s data, skipping graph 07")
+def _compute_east_west_fractions(network_dir, service_graph_edges):
+    """For each edge (caller→target) in the call graph, compute the expected
+    cross-node call fraction over time using endpoint placement snapshots.
+
+    Assumes Kubernetes uniform random load balancing across all endpoints.
+    For a caller pod on node X calling service S with N total pods (k on node X):
+        cross-node fraction = (N - k) / N
+    Weighted average across all caller pods gives the per-edge expected fraction.
+
+    Returns:
+        results: {(caller, target): [fraction_per_snapshot, ...]}
+        snapshots: [{svc: {node: count}}]
+    """
+    import glob as _glob
+    ep_files = sorted(_glob.glob(os.path.join(network_dir, "service-endpoints-*.json")))
+    if not ep_files:
+        # fallback to pod-network snapshots
+        ep_files = sorted(_glob.glob(os.path.join(network_dir, "pod-network-*.json")))
+
+    results = defaultdict(list)
+    snapshots = []
+    for p in ep_files:
+        try:
+            with open(p) as f:
+                d = json.load(f)
+        except Exception:
+            continue
+        svc_node_pods = defaultdict(lambda: defaultdict(int))
+        for item in d.get("items", []):
+            ns = (item.get("metadata") or {}).get("namespace", "")
+            if ns not in ("", "default"):
+                continue
+            # endpoint format
+            if "subsets" in item:
+                svc = item["metadata"]["name"]
+                for sub in (item.get("subsets") or []):
+                    for addr in (sub.get("addresses") or []):
+                        node = (addr.get("nodeName") or "").split(".")[0]
+                        if node:
+                            svc_node_pods[svc][node] += 1
+            else:
+                # pod format
+                labels = (item.get("metadata") or {}).get("labels", {})
+                app = labels.get("app") or labels.get("app.kubernetes.io/name")
+                node = ((item.get("spec") or {}).get("nodeName") or "").split(".")[0]
+                phase = (item.get("status") or {}).get("phase", "")
+                if app and node and phase == "Running":
+                    svc_node_pods[app][node] += 1
+
+        snapshots.append(svc_node_pods)
+
+        for caller, target in service_graph_edges:
+            caller_pods = svc_node_pods.get(caller, {})
+            target_pods = svc_node_pods.get(target, {})
+            if not caller_pods or not target_pods:
+                continue
+            total_caller = sum(caller_pods.values())
+            total_target = sum(target_pods.values())
+            if total_caller == 0 or total_target == 0:
+                continue
+            weighted_cross = 0.0
+            for node, cnt in caller_pods.items():
+                local_target = target_pods.get(node, 0)
+                cross_frac = (total_target - local_target) / total_target
+                weighted_cross += cross_frac * cnt
+            results[(caller, target)].append(weighted_cross / total_caller)
+
+    return results, snapshots
+
+
+def plot_cross_node_ratio(s2s_records, service_to_nodes, output_dir,
+                          from_loadgen_only=False, network_dir=None, service_graph_edges=None):
+    """Graph 07: East-west cross-node fraction per service-to-service call edge.
+
+    Uses the actual application call graph (not the prober) overlaid on
+    Kubernetes endpoint placement to show what fraction of each RPC type
+    crosses the east-west fabric under uniform K8s load balancing.
+    """
+    if not service_graph_edges or not network_dir:
+        print("⚠ No service graph / network_dir, skipping graph 07")
         return
 
-    def pod_to_app(name):
-        parts = name.rsplit("-", 2)
-        base = parts[0] if len(parts) >= 2 else name
-        if (base or "").lower() == "s2s" or (name or "").startswith("s2s-prober"):
-            return "prober"
-        return base
-
-    pair_counts = defaultdict(lambda: {"total": 0, "cross": 0})
-    for rec in s2s_records:
-        sn = rec.get("source_node", "unknown")
-        ts = rec.get("target_service", "unknown")
-        src = pod_to_app(rec.get("source_pod", "unknown"))
-        pair = f"{src}→{ts}"
-        target_nodes = service_to_nodes.get(ts, set())
-        pair_counts[pair]["total"] += 1
-        if sn not in target_nodes:
-            pair_counts[pair]["cross"] += 1
-
-    if not pair_counts:
-        print("⚠ No pair data for graph 07")
+    results, _ = _compute_east_west_fractions(network_dir, service_graph_edges)
+    if not results:
+        print("⚠ No east-west data computed, skipping graph 07")
         return
 
-    src_apps = sorted({p.split("→", 1)[0] for p in pair_counts})
-    pairs = []
-    for src in src_apps:
-        for svc in BOUTIQUE_SERVICES:
-            pairs.append(f"{src}→{svc}")
-    if not any(p in pair_counts for p in pairs):
-        pairs = sorted(pair_counts, key=lambda p: pair_counts[p]["cross"] / max(pair_counts[p]["total"], 1), reverse=True)
+    # Average and sort descending
+    edges_avg = {edge: sum(v) / len(v) * 100 for edge, v in results.items()}
+    edges_sorted = sorted(edges_avg.items(), key=lambda x: -x[1])
 
-    def _ratio(p):
-        c = pair_counts.get(p, {"total": 0, "cross": 0})
-        return c["cross"] / max(c["total"], 1) * 100
-    ratios = [_ratio(p) for p in pairs]
-    colors = ["#d73027" if r > 75 else "#fc8d59" if r > 40 else "#91bfdb" for r in ratios]
+    labels   = [f"{c}\n→{t}" for (c, t), _ in edges_sorted]
+    ratios   = [v for _, v in edges_sorted]
+    colors   = ["#d73027" if r > 75 else "#fc8d59" if r > 40 else "#91bfdb" for r in ratios]
 
-    title = "7. Network: cross-node call ratio per service pair"
-    if from_loadgen_only:
-        title += " (from load generator — deploy s2s-prober for per-service view)"
-
-    all_zero = all(r == 0 for r in ratios)
-
-    fig, ax = plt.subplots(figsize=(max(10, len(pairs) * 0.6), 6))
-    ax.bar(range(len(pairs)), ratios, color=colors, alpha=0.88)
-    ax.axhline(50, color="red", linestyle="--", linewidth=1, alpha=0.5, label="50% threshold")
+    fig, ax = plt.subplots(figsize=(max(12, len(labels) * 0.85), 6))
+    bars = ax.bar(range(len(labels)), ratios, color=colors, alpha=0.88, width=0.65)
+    ax.axhline(50,  color="red",    linestyle="--", linewidth=1, alpha=0.5, label="50% threshold")
     ax.axhline(100, color="#8b0000", linestyle=":", linewidth=1, alpha=0.4, label="100% (always cross-node)")
-    ax.set_xticks(range(len(pairs)))
-    ax.set_xticklabels(pairs, rotation=45, ha="right", fontsize=8)
-    ax.set_ylabel("Cross-node calls (%)", fontsize=12)
-    ax.set_ylim(0, 110)
-    ax.set_title(title + "\n(Red = >75% cross-node; orange = 40–75%; blue = <40%)",
-                 fontsize=13, fontweight="bold")
-    ax.legend(fontsize=10)
+
+    # Annotate bar values
+    for i, (bar, r) in enumerate(zip(bars, ratios)):
+        ax.text(bar.get_x() + bar.get_width() / 2, r + 1.5, f"{r:.0f}%",
+                ha="center", va="bottom", fontsize=7, color="#333333")
+
+    ax.set_xticks(range(len(labels)))
+    ax.set_xticklabels(labels, fontsize=8)
+    ax.set_ylabel("Expected cross-node calls (%)", fontsize=12)
+    ax.set_ylim(0, 115)
+    ax.set_title(
+        "7. East-West Traffic: expected cross-node fraction per service-to-service RPC\n"
+        "(Based on actual call graph + K8s endpoint placement; "
+        "assumes uniform load balancing)\n"
+        "Red >75% · Orange 40–75% · Blue <40%",
+        fontsize=11, fontweight="bold")
+    ax.legend(fontsize=9)
     ax.grid(True, alpha=0.3, axis="y")
-
-    if all_zero:
-        ax.text(0.5, 0.55,
-                "All 0%: prober is co-located with target service nodes.\n"
-                "Cross-node detection requires probe source ≠ all target nodes.\n"
-                "→ Only frontend probed; frontend has pods on every node.",
-                ha="center", va="center", transform=ax.transAxes, fontsize=10,
-                color="#8b0000",
-                bbox=dict(boxstyle="round,pad=0.5", fc="#fff8f8", ec="#d73027", alpha=0.85))
-
     plt.tight_layout()
     _save(fig, output_dir, "07_cross_node_ratio.png")
 
@@ -672,66 +720,98 @@ def plot_cross_node_ratio(s2s_records, service_to_nodes, output_dir, from_loadge
 # Graph 08 – Same-node vs cross-node latency CDF
 # ---------------------------------------------------------------------------
 
-def plot_same_vs_cross_node_cdf(s2s_records, service_to_nodes, output_dir, from_loadgen_only=False):
-    if not s2s_records:
-        print("⚠ No s2s data, skipping graph 08")
+def plot_same_vs_cross_node_cdf(s2s_records, service_to_nodes, output_dir,
+                                from_loadgen_only=False, network_dir=None,
+                                service_graph_edges=None):
+    """Graph 08: East-west traffic fraction timeline.
+
+    Shows how the expected cross-node call fraction evolves over the experiment
+    as HPA scales replicas and redistributes pods across nodes. Each line is a
+    service-to-service edge from the actual call graph.
+    """
+    if not service_graph_edges or not network_dir:
+        print("⚠ No service graph / network_dir, skipping graph 08")
         return
 
-    # Filter to successful probes only (HTTP: code 200; gRPC: code 0; or code not present)
-    same_node, cross_node = [], []
-    for rec in s2s_records:
-        total = rec.get("total")
-        code  = rec.get("code")
-        if total is None:
-            continue
-        if code is not None:
-            ok_code = 0 if rec.get("is_grpc") else 200
-            if int(code) != ok_code:
-                continue
-        sn = rec.get("source_node", "unknown")
-        tnodes = service_to_nodes.get(rec.get("target_service", ""), set())
-        if sn == "unknown" or not tnodes:
-            continue
-        if sn in tnodes:
-            same_node.append(total)
-        else:
-            cross_node.append(total)
+    import glob as _glob
 
-    if not same_node and not cross_node:
-        print("⚠ No latency data for graph 08")
+    results, _ = _compute_east_west_fractions(network_dir, service_graph_edges)
+    if not results:
+        print("⚠ No east-west timeline data, skipping graph 08")
         return
 
-    fig, ax = plt.subplots(figsize=(10, 6))
-    for latencies, label, color in [
-        (same_node,  f"Same-node  (n={len(same_node)})",  "#2166ac"),
-        (cross_node, f"Cross-node (n={len(cross_node)})", "#d6604d"),
-    ]:
-        if latencies:
-            sv = np.sort(latencies)
-            ax.plot(sv, np.arange(1, len(sv) + 1) / len(sv),
-                    linewidth=2.5, label=label, color=color)
+    # Only plot edges that have variance OR are 100% cross-node (informative either way)
+    edges_to_plot = {
+        edge: vals for edge, vals in results.items()
+        if max(vals) > 0
+    }
+    if not edges_to_plot:
+        print("⚠ All edges have 0 cross-node — skipping graph 08")
+        return
 
-    ax.set_xlabel("Total latency (ms)", fontsize=12)
-    ax.set_ylabel("CDF", fontsize=12)
-    ax.set_ylim(0, 1.05)
-    title = "8. Network penalty: same-node vs cross-node latency CDF"
-    if from_loadgen_only:
-        title += " (from load generator)"
-    ax.set_title(title + "\n(Same-node = caller & service on same host; CDF = fraction of requests ≤ x ms)",
-                 fontsize=12, fontweight="bold")
-    ax.legend(fontsize=11)
-    ax.grid(True, alpha=0.3)
+    # Separate always-100%, always-0%, and dynamic edges
+    always_100 = [(e, v) for e, v in edges_to_plot.items() if min(v) > 0.99]
+    always_0   = [(e, v) for e, v in edges_to_plot.items() if max(v) < 0.01]
+    dynamic    = [(e, v) for e, v in edges_to_plot.items()
+                  if 0.01 <= sum(v)/len(v) <= 0.99]
 
-    if not cross_node:
-        ax.text(0.5, 0.40,
-                "No cross-node data in this run.\n"
-                "Prober is co-located with all probed services\n"
-                "(frontend has pods on every node).\n"
-                "→ Expand probing to backend-only nodes for comparison.",
-                ha="center", va="center", transform=ax.transAxes, fontsize=10,
-                color="#7b3f00",
-                bbox=dict(boxstyle="round,pad=0.5", fc="#fffbe6", ec="#e67e22", alpha=0.85))
+    palette_dyn  = plt.cm.tab10.colors
+    palette_100  = ["#d73027", "#fc8d59", "#fee090", "#e0543c", "#b2182b",
+                    "#c94a2a", "#e86050"]
 
+    n_snaps = max(len(v) for v in edges_to_plot.values())
+    xs = list(range(n_snaps))
+
+    fig, axes = plt.subplots(1, 2, figsize=(16, 6), sharey=True,
+                              gridspec_kw={"width_ratios": [3, 1]})
+    ax_main, ax_bar = axes
+
+    # Main panel: dynamic edges over time
+    if dynamic:
+        for i, (edge, vals) in enumerate(sorted(dynamic, key=lambda x: -sum(x[1])/len(x[1]))):
+            color = palette_dyn[i % len(palette_dyn)]
+            avg = sum(vals) / len(vals) * 100
+            ax_main.plot(range(len(vals)), [v * 100 for v in vals],
+                         linewidth=2, alpha=0.85, color=color,
+                         label=f"{edge[0]}→{edge[1]} (avg {avg:.0f}%)")
+    else:
+        ax_main.text(0.5, 0.5, "No dynamic edges\n(all edges are constant 0% or 100%)",
+                     ha="center", va="center", transform=ax_main.transAxes, fontsize=11)
+
+    ax_main.set_xlabel("Endpoint snapshot index (time →)", fontsize=11)
+    ax_main.set_ylabel("Cross-node call fraction (%)", fontsize=11)
+    ax_main.set_ylim(-5, 110)
+    ax_main.set_title("Dynamic edges (fraction varies as HPA scales pods)", fontsize=10)
+    ax_main.axhline(50, color="grey", linestyle="--", linewidth=0.8, alpha=0.5)
+    ax_main.legend(fontsize=8, loc="upper right", ncol=1)
+    ax_main.grid(True, alpha=0.3)
+
+    # Right panel: summary bar for all edges
+    all_edges_avg = sorted(
+        [(edge, sum(v)/len(v)*100) for edge, v in edges_to_plot.items()],
+        key=lambda x: -x[1]
+    )
+    bar_labels = [f"{c}→{t}" for (c, t), _ in all_edges_avg]
+    bar_vals   = [v for _, v in all_edges_avg]
+    bar_colors = ["#d73027" if v > 75 else "#fc8d59" if v > 40 else "#91bfdb"
+                  for v in bar_vals]
+    y_pos = range(len(bar_labels))
+    ax_bar.barh(y_pos, bar_vals, color=bar_colors, alpha=0.85, height=0.65)
+    ax_bar.set_yticks(y_pos)
+    ax_bar.set_yticklabels(bar_labels, fontsize=8)
+    ax_bar.set_xlim(0, 115)
+    ax_bar.set_xlabel("Avg cross-node %", fontsize=9)
+    ax_bar.axvline(50, color="grey", linestyle="--", linewidth=0.8, alpha=0.5)
+    ax_bar.set_title("Avg over experiment", fontsize=10)
+    for i, v in enumerate(bar_vals):
+        ax_bar.text(v + 1, i, f"{v:.0f}%", va="center", fontsize=7)
+    ax_bar.grid(True, alpha=0.3, axis="x")
+
+    fig.suptitle(
+        "8. East-West Traffic Timeline: cross-node fraction per service-to-service RPC\n"
+        "(Computed from call graph + K8s endpoint snapshots; assumes uniform load balancing)",
+        fontsize=11, fontweight="bold"
+    )
     plt.tight_layout()
     _save(fig, output_dir, "08_same_vs_cross_node_cdf.png")
 
@@ -1436,6 +1516,24 @@ def main():
     service_to_nodes = load_service_endpoint_nodes(data_dir)
     latency_rows     = load_latency_vs_replicas(data_dir)
 
+    # Load service call graph for east-west traffic analysis (graphs 07 + 08)
+    _sg_path = os.path.join(data_dir, "baseline", "service-graph.json")
+    service_graph_edges = []
+    if os.path.exists(_sg_path):
+        try:
+            with open(_sg_path) as _f:
+                _sg = json.load(_f)
+            service_graph_edges = [
+                (e["from"].split("/")[1], e["to"].split("/")[1])
+                for e in _sg.get("edges", [])
+                if e.get("from", "").startswith("default/")
+                and e.get("to", "").startswith("default/")
+            ]
+            print(f"  Loaded {len(service_graph_edges)} service graph edges")
+        except Exception as _e:
+            print(f"  ⚠ Could not load service graph: {_e}")
+    _network_dir = os.path.join(data_dir, "network-analysis")
+
     if s2s_records:
         print(f"  Loaded {len(s2s_records)} s2s probe records")
     else:
@@ -1464,8 +1562,12 @@ def main():
     generate_summary_stats(bursts, snapshots, output_dir)
 
     print("\nGenerating graphs 07–11 (network analysis)...")
-    _plot("07", plot_cross_node_ratio,          s2s_for_net, service_to_nodes, output_dir, from_loadgen_only=from_lg_only)
-    _plot("08", plot_same_vs_cross_node_cdf,    s2s_for_net, service_to_nodes, output_dir, from_loadgen_only=from_lg_only)
+    _plot("07", plot_cross_node_ratio,          s2s_for_net, service_to_nodes, output_dir,
+          from_loadgen_only=from_lg_only,
+          network_dir=_network_dir, service_graph_edges=service_graph_edges)
+    _plot("08", plot_same_vs_cross_node_cdf,    s2s_for_net, service_to_nodes, output_dir,
+          from_loadgen_only=from_lg_only,
+          network_dir=_network_dir, service_graph_edges=service_graph_edges)
     _plot("09", plot_p95_vs_replicas,           latency_rows, output_dir)
     _plot("09b", plot_p95_vs_node_count,        latency_rows, output_dir)
     # Graphs 10 and 10b only provide value when probes come from multiple source nodes;
