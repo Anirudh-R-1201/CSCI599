@@ -1,117 +1,147 @@
-# Stage 1 Baseline (Refined)
+# Stage 1 Baseline
 
-This folder now uses a minimal workflow:
+## Files
 
-- `01-run-experiment.sh` - single runner
-- `02-analyze-results.sh` - single analyzer
-- `03e-bursty-highload-network-test.sh` - bursty high-load generator + telemetry (internal)
-- `07-setup-hpa.sh` - HPA helper (internal)
-- `07-analyze-network-data.py` - analysis engine (internal)
-- `06-generate-graphs.py` - graph generator (internal)
-
-See **REQUIREMENTS.md** for how each original requirement is covered.
+| File | Role |
+|---|---|
+| `01-run-experiment.sh` | Top-level runner |
+| `02-analyze-results.sh` | Top-level analyzer |
+| `03e-bursty-highload-network-test.sh` | Load generation + telemetry collection |
+| `k6-load-test.js` | k6 scenario script (stateful checkout, all endpoints) |
+| `k6-loadgen.yaml` | k6 pod (HTTP load generation) |
+| `fortio-loadgen.yaml` | fortio pod (gRPC health probes only) |
+| `s2s-prober.yaml` | curl probe pod (HTTP s2s latency: dns/connect/ttfb) |
+| `07-setup-hpa.sh` | HPA configuration |
+| `07-analyze-network-data.py` | Analysis engine |
+| `06-generate-graphs.py` | Graph generator |
 
 ## Quick Start
 
 ```bash
 cd ~/CSCI599/stage1-baseline
 
-# Full run: deploy, set HPA, run bursty load, collect baseline snapshots
+# Full run: deploy, configure HPA, run load, collect telemetry
 MODE=full ./01-run-experiment.sh && ./02-analyze-results.sh
 
-#Also run in the bg
+# Approve CSRs in background (required on CloudLab)
 while true; do sleep 2 && kubectl get csr -o name | xargs kubectl certificate approve 2>/dev/null; done
-
-
-# Analyze latest run
-./02-analyze-results.sh
 ```
 
 ## Runner Modes
 
-`01-run-experiment.sh` supports:
+`01-run-experiment.sh` `MODE`:
+- `full` – deploy + HPA + traffic + baseline collection
+- `prep` – deploy + HPA only
+- `traffic` – traffic + telemetry only (cluster already deployed)
 
-- `MODE=full` – deploy + HPA + traffic + baseline collection (also approves pending CSRs before starting)
-- `MODE=prep` – deploy + HPA only (also approves pending CSRs)
-- `MODE=traffic` – traffic + telemetry only
+Key variables:
 
-Useful variables:
-
-- `CPU_THRESHOLD` (default `75`) – HPA CPU target %; use 50 for more aggressive scaling
-- `BURSTS` (default `18`)
-- `BASE_BURST_SECONDS` (default `45`), `MAX_BURST_SECONDS` (default `90`) – burst length so HPA can scale up
-- `MIN_SLEEP_SECONDS` (default `45`), `MAX_SLEEP_SECONDS` (default `120`) – **time between bursts** so replicas can scale down; longer gaps make scale-up/scale-down and cross-node latency effects more visible
-- `QPS_FLOOR` (default `80`), `QPS_CEIL` (default `500`) – load range; lower ceiling keeps latency readable and highlights networking cost when pods are spread across nodes
-- `THREADS_PER_ENDPOINT` (default `12`)
-- `SAMPLE_INTERVAL` (default `8`)
-
-Example:
+| Variable | Default | Effect |
+|---|---|---|
+| `CPU_THRESHOLD` | `75` | HPA CPU target %; lower = more aggressive scaling |
+| `BURSTS` | `18` | Number of load bursts |
+| `BASE_BURST_SECONDS` | `45` | Min burst duration |
+| `MAX_BURST_SECONDS` | `90` | Max burst duration |
+| `MIN_SLEEP_SECONDS` | `45` | Min gap between bursts (HPA scale-down time) |
+| `MAX_SLEEP_SECONDS` | `120` | Max gap between bursts |
+| `QPS_FLOOR` | `80` | Minimum burst QPS |
+| `QPS_CEIL` | `300` | Maximum burst QPS |
+| `SAMPLE_INTERVAL` | `8` | Telemetry snapshot interval (seconds) |
+| `W_HOME/PRODUCT/CART/CHECKOUT` | `0.30/0.35/0.20/0.15` | Endpoint weight split |
 
 ```bash
+# Default run
 MODE=full ./01-run-experiment.sh
-# Higher load / more bursts: BURSTS=24 QPS_CEIL=800 ./01-run-experiment.sh
-# If replicas don't scale: CPU_THRESHOLD=50
+
+# More bursts, higher load
+BURSTS=24 QPS_CEIL=400 MODE=full ./01-run-experiment.sh
+
+# If HPA doesn't scale up
+CPU_THRESHOLD=50 MODE=full ./01-run-experiment.sh
 ```
 
-## Fixed-node experiments (no node scaling)
+## Load Generation (k6)
 
-The cluster has a **fixed set of nodes**; only **pods** scale (HPA). `node_count` in the analysis means *how many of those nodes have ≥1 workload pod* (pod spread), not cluster size.
+Each burst runs `k6-load-test.js` on the `k6-loadgen` pod with `constant-arrival-rate`
+scenarios for four endpoints:
 
-**Metrics that matter:**
-- **Same-node vs cross-node latency** (graphs 07, 08): latency when caller and callee share a node vs different nodes.
-- **Pod spread vs latency** (graph 09b, section 6 of `analysis-summary.txt`): correlation between `node_count` and s2s p95; higher spread often means more cross-node traffic and higher latency.
-- **Queueing vs network RTT** (graph 11): separates overlay/network cost from app queueing.
-- **Tail latency by (source_node, target_service)** (graph 10, section 5): which node pairs see the worst latency.
+| Endpoint | Services exercised |
+|---|---|
+| `GET /` | frontend → productcatalog, currency, recommendation, adservice |
+| `GET /product/:id` | frontend → productcatalog, currency, recommendation |
+| `GET /cart` | frontend → cartservice, currency |
+| `POST /cart/checkout` | frontend → checkoutservice → **paymentservice, shippingservice, emailservice, currencyservice, cartservice, productcatalogservice** |
 
-See `experiment-metrics-recommendations.md` for the same list and quick facts.
+Checkout is a stateful 2-step VU flow (add-to-cart then checkout). Each k6 VU
+maintains its own cookie jar so carts are independent — the full downstream
+call chain fires on every checkout iteration.
+
+gRPC health probes (s2s latency) continue to use `fortio-loadgen` since k6
+does not support the gRPC health check protocol.
+
+## East-West Traffic Analysis
+
+Graphs 07 and 08 show **actual application cross-node traffic** derived from
+the service call graph + Kubernetes endpoint placement snapshots, assuming
+uniform K8s load balancing. This is not prober traffic — it reflects what
+fraction of each RPC type (e.g. `checkoutservice → paymentservice`) must
+traverse the east-west fabric given the current pod placement.
+
+Key metrics:
+- **Graph 07** – average cross-node fraction per call edge (bar chart)
+- **Graph 08** – cross-node fraction timeline as HPA reshuffles pods
+- **Graph 11** – server-side queueing vs network RTT (log scale Y-axis)
+- **Graph 12** – connection-time CDF (bimodal: same-node vs cross-node DNS path)
 
 ## Analysis
 
-`02-analyze-results.sh [RUN_DIR]`
+```bash
+./02-analyze-results.sh              # latest run
+./02-analyze-results.sh data/<RUN_ID>  # specific run
+```
 
-- If `RUN_DIR` is omitted, latest run under `data/` is used.
-- Runs:
-  - `07-analyze-network-data.py`
-  - `06-generate-graphs.py` (installs `matplotlib` if missing so graphs 01–11 run on CloudLab)
+Runs `07-analyze-network-data.py` then `06-generate-graphs.py`.
 
-Primary outputs:
+Primary outputs under `data/<RUN_ID>/`:
 
-- `network-analysis/analysis-summary.txt` (sections: Node→Pods, **Service→Nodes** (which service's pods are on which node), e2e latency, s2s, queueing vs network, node-pair tail latency)
-- `network-analysis/pod-placement-analysis.json`
-- `network-analysis/e2e-latency-summary.json`
-- `network-analysis/service-to-service-latency-summary.json`
-- `network-analysis/node-pair-latency-summary.json` (p95/p99 by source_node → target_service)
-- `network-analysis/latency-vs-replicas.csv` (HPA desired/current, s2s p95/p99, and **node_count** per timestamp)
-- `network-analysis/experiment-metrics-recommendations.md`
-- `graphs/*.png`: 01–06 (load, latency, scaling, placement); 07–11 (cross-node ratio, same vs cross-node CDF, p95 vs replicas/node count, heatmap, queueing vs RTT). See `graphs/README.txt`.
+```
+network-analysis/
+  analysis-summary.txt              service→node placement, e2e & s2s latency, queueing
+  e2e-latency-summary.json
+  service-to-service-latency.jsonl  raw per-probe records (HTTP + gRPC)
+  service-to-service-latency-summary.json
+  latency-vs-replicas.csv           HPA replica counts + s2s p95/p99 over time
+  experiment-metrics-recommendations.md
+graphs/
+  01–06   load, latency percentiles, HPA scaling, pod placement
+  07–08   east-west cross-node fraction (call graph + endpoint placement)
+  09–09b  p95 vs replica count / pod spread
+  11–11b  queueing vs RTT, network RTT distribution
+  12      connection-time CDF
+  13      HPA scaling timeline vs p95 latency
+  14      per-endpoint latency box plots
+  README.txt
+```
 
 ## Data Layout
 
-```text
+```
 data/<RUN_ID>/
 ├── loadgen/
-│   ├── bursts.jsonl
-│   └── fortio-burst-*-{home,product,cart}.json
+│   ├── bursts.jsonl                 burst plan (QPS, duration, type per burst)
+│   ├── k6-burst-*.json              k6 per-endpoint latency summary per burst
+│   └── k6-burst-*.log               k6 stdout/stderr per burst
 ├── network-analysis/
-│   ├── pod-network-*.json
-│   ├── service-endpoints-*.json
-│   ├── node-network-*.json
-│   ├── hpa-*.json
-│   ├── service-to-service-latency.jsonl
-│   ├── analysis-summary.txt
-│   ├── pod-placement-analysis.json
-│   ├── e2e-latency-summary.json
-│   ├── service-to-service-latency-summary.json
-│   ├── node-pair-latency-summary.json
-│   ├── latency-vs-replicas.csv
-│   └── experiment-metrics-recommendations.md
+│   ├── service-endpoints-*.json     kubectl get endpoints snapshots
+│   ├── pod-network-*.json           kubectl get pods snapshots
+│   ├── hpa-*.json                   HPA replica count snapshots
+│   ├── top-pods-*.txt / top-nodes-*.txt
+│   └── service-to-service-latency.jsonl
 └── baseline/
-    ├── nodes.{txt,json}
     ├── pods.{txt,json}
-    ├── services.yaml
+    ├── nodes.{txt,json}
+    ├── service-graph.{json,csv}     call graph edges (used for graphs 07/08)
     ├── endpoints.yaml
     ├── deployments.yaml
-    ├── events.txt
-    ├── service-graph.{json,csv}
-    └── latency-summary.json
+    └── events.txt
 ```

@@ -1,0 +1,20 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: k6-loadgen
+  labels:
+    app: k6-loadgen
+spec:
+  restartPolicy: Never
+  containers:
+    - name: k6
+      image: grafana/k6:latest
+      # Keep pod alive between burst runs so we don't pay pod startup overhead.
+      command: ["sleep", "infinity"]
+      resources:
+        requests:
+          cpu: "500m"
+          memory: "256Mi"
+        limits:
+          cpu: "2000m"
+          memory: "512Mi"

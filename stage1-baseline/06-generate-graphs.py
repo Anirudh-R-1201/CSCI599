@@ -52,56 +52,120 @@ BOUTIQUE_SERVICES = [
 # Data loaders
 # ---------------------------------------------------------------------------
 
-def load_burst_data(data_dir):
-    """Load latency data from all fortio burst files, extracting endpoint label."""
-    loadgen_dir = os.path.join(data_dir, "loadgen")
-    burst_files = sorted(glob.glob(os.path.join(loadgen_dir, "fortio-burst-*.json")))
-    bursts = []
-    for file_path in burst_files:
-        with open(file_path, 'r') as f:
-            data = json.load(f)
-        base = os.path.basename(file_path).replace(".json", "").replace("fortio-burst-", "")
-        parts = base.split("-")
-        try:
-            burst_index = int(parts[0])
-        except (ValueError, IndexError):
-            burst_index = len(bursts)
-        endpoint = parts[1] if len(parts) >= 2 else "all"
-        percentiles = {p["Percentile"]: p["Value"] for p in
-                       data.get("DurationHistogram", {}).get("Percentiles", [])}
-        # ConnectionStats: list of per-connection times (seconds)
-        conn_stats = data.get("ConnectionStats", {})
-        conn_p50 = conn_p95 = None
-        for cp in conn_stats.get("Percentiles", []):
-            if cp.get("Percentile") == 50:
-                conn_p50 = cp["Value"] * 1000  # → ms
-            if cp.get("Percentile") == 95:
-                conn_p95 = cp["Value"] * 1000
-        bursts.append({
-            "file": os.path.basename(file_path),
-            "index": burst_index,
-            "endpoint": endpoint,
-            "start_time": data.get("StartTime", ""),
-            "requested_qps": float(data.get("RequestedQPS", 0)),
-            "actual_qps": data.get("ActualQPS", 0),
-            "duration_s": data.get("ActualDuration", 0) / 1e9,
-            "p50":  percentiles.get(50,   0),
-            "p90":  percentiles.get(90,   0),
-            "p95":  percentiles.get(95,   0),
-            "p99":  percentiles.get(99,   0),
-            "p999": percentiles.get(99.9, 0),
-            "avg":  data.get("DurationHistogram", {}).get("Avg", 0),
-            "count": data.get("DurationHistogram", {}).get("Count", 0),
-            "conn_p50_ms": conn_p50,
-            "conn_p95_ms": conn_p95,
-            # Raw connection time samples (seconds → ms) for CDF
-            "conn_times_ms": [
-                entry["Start"] * 1000
-                for entry in conn_stats.get("Data", [])
-                for _ in range(int(entry.get("Count", 0)))
-            ],
+def _parse_fortio_burst_file(file_path, burst_index, endpoint):
+    """Parse a single fortio JSON result file into the standard burst record."""
+    with open(file_path, 'r') as f:
+        data = json.load(f)
+    percentiles = {p["Percentile"]: p["Value"] for p in
+                   data.get("DurationHistogram", {}).get("Percentiles", [])}
+    conn_stats = data.get("ConnectionStats", {})
+    conn_p50 = conn_p95 = None
+    for cp in conn_stats.get("Percentiles", []):
+        if cp.get("Percentile") == 50:
+            conn_p50 = cp["Value"] * 1000
+        if cp.get("Percentile") == 95:
+            conn_p95 = cp["Value"] * 1000
+    return {
+        "file":          os.path.basename(file_path),
+        "index":         burst_index,
+        "endpoint":      endpoint,
+        "start_time":    data.get("StartTime", ""),
+        "requested_qps": float(data.get("RequestedQPS", 0)),
+        "actual_qps":    data.get("ActualQPS", 0),
+        "duration_s":    data.get("ActualDuration", 0) / 1e9,
+        "p50":  percentiles.get(50,   0),
+        "p90":  percentiles.get(90,   0),
+        "p95":  percentiles.get(95,   0),
+        "p99":  percentiles.get(99,   0),
+        "p999": percentiles.get(99.9, 0),
+        "avg":  data.get("DurationHistogram", {}).get("Avg", 0),
+        "count": data.get("DurationHistogram", {}).get("Count", 0),
+        "conn_p50_ms":  conn_p50,
+        "conn_p95_ms":  conn_p95,
+        "conn_times_ms": [
+            entry["Start"] * 1000
+            for entry in conn_stats.get("Data", [])
+            for _ in range(int(entry.get("Count", 0)))
+        ],
+    }
+
+
+def _parse_k6_burst_file(file_path):
+    """Parse a k6 handleSummary JSON file into one burst record per endpoint.
+
+    k6 writes times in seconds (converted from ms in handleSummary).
+    Returns a list of burst records — one per endpoint in the summary.
+    """
+    with open(file_path, 'r') as f:
+        data = json.load(f)
+
+    burst_index  = data.get("burst_index", 0)
+    burst_type   = data.get("burst_type",  "unknown")
+    total_qps    = data.get("total_qps",   0)
+    duration_s   = data.get("duration_s",  0)
+    endpoints    = data.get("endpoints",   {})
+
+    records = []
+    for ep, stats in endpoints.items():
+        if not stats:
+            continue
+        records.append({
+            "file":          os.path.basename(file_path),
+            "index":         burst_index,
+            "endpoint":      ep,
+            "start_time":    "",
+            "requested_qps": total_qps,
+            "actual_qps":    stats.get("actual_qps", 0),
+            "duration_s":    duration_s,
+            # k6 handleSummary stores values in seconds already
+            "p50":  stats.get("p50",  0),
+            "p90":  stats.get("p90",  0),
+            "p95":  stats.get("p95",  0),
+            "p99":  stats.get("p99",  0),
+            "p999": stats.get("p999", 0),
+            "avg":  stats.get("avg",  0),
+            "count": int(stats.get("count", 0)),
+            "conn_p50_ms":  None,
+            "conn_p95_ms":  None,
+            "conn_times_ms": [],
         })
-    return sorted(bursts, key=lambda x: (x["index"], x["file"]))
+    return records
+
+
+def load_burst_data(data_dir):
+    """Load latency data from k6 or fortio burst files in loadgen/.
+
+    Prefers k6-burst-*.json (new format); falls back to fortio-burst-*.json
+    (legacy format) so old experiment runs still graph correctly.
+    """
+    loadgen_dir = os.path.join(data_dir, "loadgen")
+    bursts = []
+
+    # ── k6 output (primary) ───────────────────────────────────────────────────
+    k6_files = sorted(glob.glob(os.path.join(loadgen_dir, "k6-burst-*.json")))
+    for file_path in k6_files:
+        try:
+            bursts.extend(_parse_k6_burst_file(file_path))
+        except Exception as e:
+            print(f"  ⚠ Could not parse {os.path.basename(file_path)}: {e}")
+
+    # ── fortio output (fallback for legacy runs) ──────────────────────────────
+    if not bursts:
+        fortio_files = sorted(glob.glob(os.path.join(loadgen_dir, "fortio-burst-*.json")))
+        for file_path in fortio_files:
+            base   = os.path.basename(file_path).replace(".json", "").replace("fortio-burst-", "")
+            parts  = base.split("-")
+            try:
+                burst_index = int(parts[0])
+            except (ValueError, IndexError):
+                burst_index = len(bursts)
+            endpoint = parts[1] if len(parts) >= 2 else "all"
+            try:
+                bursts.append(_parse_fortio_burst_file(file_path, burst_index, endpoint))
+            except Exception as e:
+                print(f"  ⚠ Could not parse {os.path.basename(file_path)}: {e}")
+
+    return sorted(bursts, key=lambda x: (x["index"], x["endpoint"]))
 
 
 def load_bursts_jsonl(data_dir):

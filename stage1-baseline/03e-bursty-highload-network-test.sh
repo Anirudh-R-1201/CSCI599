@@ -2,7 +2,9 @@
 set -euo pipefail
 
 # Bursty high-load traffic + network telemetry collector.
-# Designed to stress HPAs configured near 75% CPU target.
+# Load generation: k6 (supports stateful checkout flow).
+# gRPC s2s probes: fortio-loadgen (health check probes to backend services).
+# HTTP s2s probes: s2s-prober pod (curl with dns/connect/ttfb breakdown).
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 KUBECONFIG_PATH="${KUBECONFIG_PATH:-$HOME/.kube/config}"
@@ -14,38 +16,32 @@ NET_DIR="${DATA_DIR_BASE}/network-analysis"
 
 mkdir -p "${LOAD_DIR}" "${NET_DIR}"
 
-# Traffic settings.
-# Longer inter-burst gaps (MIN/MAX_SLEEP) give time for HPA to scale down between bursts.
+# ── Traffic settings ──────────────────────────────────────────────────────────
+# Total QPS across all frontend endpoints. At ~160 QPS total a 5-node cluster
+# is already under heavy load; spikes go up to QPS_CEIL.
 BURSTS="${BURSTS:-18}"
 BASE_BURST_SECONDS="${BASE_BURST_SECONDS:-45}"
 MAX_BURST_SECONDS="${MAX_BURST_SECONDS:-90}"
 MIN_SLEEP_SECONDS="${MIN_SLEEP_SECONDS:-45}"
 MAX_SLEEP_SECONDS="${MAX_SLEEP_SECONDS:-120}"
-THREADS_PER_ENDPOINT="${THREADS_PER_ENDPOINT:-12}"
-# Total QPS across all endpoints. Keep well below cluster saturation —
-# at ~160 QPS total the 5-node cluster is already heavily loaded.
-# Spikes go up to QPS_CEIL; heavy-tail baseline distributes around QPS_FLOOR.
 QPS_FLOOR="${QPS_FLOOR:-80}"
 QPS_CEIL="${QPS_CEIL:-300}"
 SPIKE_PROBABILITY="${SPIKE_PROBABILITY:-0.35}"
 
-# Relative endpoint weights.
-# Home/product/cart cover the shallow call chains (catalog, currency, recommendation).
-# Product detail page is the most reliable way to exercise productcatalogservice,
-# recommendationservice, and currencyservice without stateful side effects.
-# Checkout via fortio is stateless-hostile (empties cart on first call) so we
-# weight it low and rely on the product/cart paths for east-west coverage instead.
-WEIGHT_HOME="${WEIGHT_HOME:-0.35}"
-WEIGHT_PRODUCT="${WEIGHT_PRODUCT:-0.40}"
-WEIGHT_CART="${WEIGHT_CART:-0.25}"
-WEIGHT_CHECKOUT="${WEIGHT_CHECKOUT:-0.00}"
+# Endpoint weights (must sum to 1.0).
+# Checkout is a stateful 2-step flow (add-to-cart → submit); k6 VUs maintain
+# their own cookie jar so each VU's cart is independent — checkout actually
+# exercises the full downstream call chain on every iteration.
+W_HOME="${W_HOME:-0.30}"
+W_PRODUCT="${W_PRODUCT:-0.35}"
+W_CART="${W_CART:-0.20}"
+W_CHECKOUT="${W_CHECKOUT:-0.15}"
 
-# Export so inline Python (burst plan) can read them
 export BURSTS BASE_BURST_SECONDS MAX_BURST_SECONDS MIN_SLEEP_SECONDS MAX_SLEEP_SECONDS
 export QPS_FLOOR QPS_CEIL SPIKE_PROBABILITY
-export WEIGHT_HOME WEIGHT_PRODUCT WEIGHT_CART
+export W_HOME W_PRODUCT W_CART W_CHECKOUT
 
-# Monitoring settings.
+# ── Monitoring settings ───────────────────────────────────────────────────────
 SAMPLE_INTERVAL="${SAMPLE_INTERVAL:-8}"
 S2S_PROBE_REPEAT="${S2S_PROBE_REPEAT:-3}"
 TARGET_SERVICES_CSV="${TARGET_SERVICES_CSV:-frontend,productcatalogservice,recommendationservice,cartservice,checkoutservice,paymentservice,shippingservice,currencyservice}"
@@ -54,19 +50,26 @@ META_FILE="${LOAD_DIR}/bursts.jsonl"
 S2S_FILE="${NET_DIR}/service-to-service-latency.jsonl"
 
 echo "=========================================="
-echo "Bursty High-Load Network Test"
+echo "Bursty High-Load Network Test (k6)"
 echo "=========================================="
 echo "Run ID: ${RUN_ID}"
 echo "Output: ${DATA_DIR_BASE}"
 echo ""
 
-echo "Deploying or refreshing fortio load generator..."
+# ── Deploy pods ───────────────────────────────────────────────────────────────
+echo "Deploying k6-loadgen (HTTP load) and fortio-loadgen (gRPC probes)..."
+kubectl --kubeconfig "${KUBECONFIG_PATH}" apply -f "${ROOT_DIR}/k6-loadgen.yaml"    >/dev/null
 kubectl --kubeconfig "${KUBECONFIG_PATH}" apply -f "${ROOT_DIR}/fortio-loadgen.yaml" >/dev/null
+kubectl --kubeconfig "${KUBECONFIG_PATH}" wait --for=condition=Ready pod/k6-loadgen     --timeout=180s >/dev/null
 kubectl --kubeconfig "${KUBECONFIG_PATH}" wait --for=condition=Ready pod/fortio-loadgen --timeout=180s >/dev/null
 
-# Prefer s2s-prober for HTTP service-to-service probes (client → boutique services); fall back to fortio-loadgen.
-# gRPC services are always probed via fortio-loadgen using fortio's built-in gRPC health check.
-S2S_SOURCE_POD=$(kubectl --kubeconfig "${KUBECONFIG_PATH}" get pods -l app=s2s-prober -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)
+# Copy k6 script to the load generator pod
+kubectl --kubeconfig "${KUBECONFIG_PATH}" cp \
+  "${ROOT_DIR}/k6-load-test.js" k6-loadgen:/tmp/k6-load-test.js
+
+# ── s2s probe pod ─────────────────────────────────────────────────────────────
+S2S_SOURCE_POD=$(kubectl --kubeconfig "${KUBECONFIG_PATH}" \
+  get pods -l app=s2s-prober -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)
 if [ -z "${S2S_SOURCE_POD}" ]; then
   S2S_SOURCE_POD="fortio-loadgen"
   echo "Using fortio-loadgen for HTTP s2s probes (s2s-prober not found)."
@@ -76,8 +79,6 @@ fi
 export S2S_SOURCE_POD
 
 # ── gRPC pre-flight check ─────────────────────────────────────────────────────
-# Verify that fortio can run a gRPC probe and produce JSON on stdout.
-# Stderr is captured separately so log noise doesn't break JSON parsing.
 echo "Running gRPC pre-flight check (fortio-loadgen → productcatalogservice:3550)..."
 _pf_err_file="/tmp/grpc-preflight-err-$$"
 grpc_preflight_json=$(kubectl --kubeconfig "${KUBECONFIG_PATH}" exec fortio-loadgen -- \
@@ -88,7 +89,6 @@ import json, sys
 try:
     d = json.load(sys.stdin)
     codes = d.get('RetCodes') or {}
-    # Accept both numeric 0 and string 'SERVING' as success
     ok = any(str(k).upper() in ('0','SERVING','OK') for k in codes)
     print('ok:' + str(codes) + (' [SERVING]' if ok else ' [FAILED]'))
 except Exception as e:
@@ -100,16 +100,13 @@ if [[ "${grpc_preflight_ok}" == ok:* ]]; then
 else
   echo "  ⚠ gRPC pre-flight FAILED: ${grpc_preflight_ok}"
   echo "  stderr: $(cat "${_pf_err_file}" 2>/dev/null | head -3)"
-  echo "  stdout: $(echo "${grpc_preflight_json}" | head -3)"
-  echo "  → Falling back to HTTP-only s2s probes (gRPC services will show no data)."
+  echo "  → Falling back to HTTP-only s2s probes."
   GRPC_PROBE_ENABLED=0
 fi
 rm -f "${_pf_err_file}"
 export GRPC_PROBE_ENABLED
 
-# Map each service to its protocol and port.
-# HTTP services are probed via curl (fast timing breakdown: dns/connect/ttfb/total).
-# gRPC services are probed via fortio health check (total latency only).
+# ── Service protocol/port map ─────────────────────────────────────────────────
 get_service_proto_port() {
   case "$1" in
     frontend)                echo "http:80"    ;;
@@ -125,40 +122,26 @@ get_service_proto_port() {
   esac
 }
 
-echo "Checking HPA targets (expecting 75% if configured that way)..."
 kubectl --kubeconfig "${KUBECONFIG_PATH}" get hpa -o wide > "${NET_DIR}/hpa-before.txt" || true
 
-PRODUCT_ID=$(kubectl --kubeconfig "${KUBECONFIG_PATH}" exec fortio-loadgen -- \
-  sh -c "curl -s http://frontend:80/ | sed -n 's|.*href=\"/product/\\([^\"]*\\)\".*|\\1|p' | head -1" 2>/dev/null || true)
-PRODUCT_ID="${PRODUCT_ID:-OLJCESPC7Z}"
-
-HOME_URL="http://frontend:80/"
-PRODUCT_URL="http://frontend:80/product/${PRODUCT_ID}"
-CART_URL="http://frontend:80/cart"
-
-# NOTE: checkout (POST /cart/checkout) is NOT load-tested via fortio because it
-# empties the cart on each call, so only the first request exercises the full
-# checkoutservice fan-out; subsequent requests return "empty cart" errors.
-# The /product/:id path reliably exercises frontend→{productcatalog,currency,
-# recommendation} on every request and is the primary east-west driver here.
-
+# ── Cluster snapshot function ─────────────────────────────────────────────────
 capture_cluster_snapshot() {
   local timestamp="$1"
-  kubectl --kubeconfig "${KUBECONFIG_PATH}" get pods -n default -o json > "${NET_DIR}/pod-network-${timestamp}.json" || true
+  kubectl --kubeconfig "${KUBECONFIG_PATH}" get pods     -n default -o json > "${NET_DIR}/pod-network-${timestamp}.json"      || true
   kubectl --kubeconfig "${KUBECONFIG_PATH}" get endpoints -n default -o json > "${NET_DIR}/service-endpoints-${timestamp}.json" || true
-  kubectl --kubeconfig "${KUBECONFIG_PATH}" get nodes -o json > "${NET_DIR}/node-network-${timestamp}.json" || true
-  kubectl --kubeconfig "${KUBECONFIG_PATH}" get hpa -n default -o json > "${NET_DIR}/hpa-${timestamp}.json" || true
-  kubectl --kubeconfig "${KUBECONFIG_PATH}" top pods -n default --no-headers > "${NET_DIR}/top-pods-${timestamp}.txt" 2>/dev/null || true
-  kubectl --kubeconfig "${KUBECONFIG_PATH}" top nodes --no-headers > "${NET_DIR}/top-nodes-${timestamp}.txt" 2>/dev/null || true
+  kubectl --kubeconfig "${KUBECONFIG_PATH}" get nodes     -o json             > "${NET_DIR}/node-network-${timestamp}.json"     || true
+  kubectl --kubeconfig "${KUBECONFIG_PATH}" get hpa       -n default -o json  > "${NET_DIR}/hpa-${timestamp}.json"              || true
+  kubectl --kubeconfig "${KUBECONFIG_PATH}" top pods -n default --no-headers  > "${NET_DIR}/top-pods-${timestamp}.txt"  2>/dev/null || true
+  kubectl --kubeconfig "${KUBECONFIG_PATH}" top nodes --no-headers            > "${NET_DIR}/top-nodes-${timestamp}.txt" 2>/dev/null || true
 }
 
+# ── s2s latency probe function ────────────────────────────────────────────────
 probe_service_latencies() {
   local timestamp="$1"
   local targets="$2"
   local http_pod="${S2S_SOURCE_POD:-fortio-loadgen}"
   local grpc_pod="fortio-loadgen"
 
-  # Resolve source node for the HTTP prober (used for topology graphs).
   local http_node grpc_node
   http_node=$(kubectl --kubeconfig "${KUBECONFIG_PATH}" get pod "${http_pod}" \
     -o jsonpath='{.spec.nodeName}' 2>/dev/null || echo "unknown")
@@ -176,28 +159,21 @@ probe_service_latencies() {
     t="$(echo "${target}" | xargs)"
     [ -z "${t}" ] && continue
 
-    local proto_port
+    local proto_port proto port
     proto_port="$(get_service_proto_port "${t}")"
-    local proto="${proto_port%%:*}"
-    local port="${proto_port##*:}"
+    proto="${proto_port%%:*}"
+    port="${proto_port##*:}"
 
     for ((k=0; k<S2S_PROBE_REPEAT; k++)); do
       local probe source_pod source_node
 
       if [ "${proto}" = "grpc" ] && [ "${GRPC_PROBE_ENABLED:-0}" = "1" ]; then
-        # ── gRPC probe via fortio health check ──────────────────────────────
-        # Uses the standard gRPC health check protocol (grpc.health.v1.Health/Check).
-        # All Online Boutique gRPC services expose this endpoint (confirmed via K8s grpc probes).
-        # NOTE: Do NOT pass -grpc-health-svc "" — some fortio versions emit no JSON with that flag.
-        # Just -grpc alone invokes the health check with an empty (server-wide) service name.
-        # gRPC codes: 0=OK, 2=UNKNOWN, 12=UNIMPLEMENTED, 14=UNAVAILABLE
         source_pod="${grpc_pod}"
         source_node="${grpc_node}"
         local raw grpc_err_file
         grpc_err_file="/tmp/grpc-err-${t}-${k}-$$"
         raw=$(kubectl --kubeconfig "${KUBECONFIG_PATH}" exec "${grpc_pod}" -- \
-          fortio load -grpc \
-            -c 1 -n 1 -qps 0 -json - "${t}:${port}" \
+          fortio load -grpc -c 1 -n 1 -qps 0 -json - "${t}:${port}" \
           2>"${grpc_err_file}" || true)
         if [ -z "${raw}" ]; then
           echo "⚠ gRPC probe empty for ${t}:${port} (stderr: $(cat "${grpc_err_file}" 2>/dev/null | head -1))" >&2
@@ -205,8 +181,6 @@ probe_service_latencies() {
         rm -f "${grpc_err_file}"
         probe=$(echo "${raw}" | python3 -c "
 import json, sys
-# fortio gRPC RetCodes uses string keys like 'SERVING', 'NOT_SERVING', etc.
-# Map them to numeric gRPC status codes (0=OK, 2=UNKNOWN, 5=NOT_FOUND, 14=UNAVAILABLE)
 GRPC_CODE_MAP = {'SERVING': 0, 'NOT_SERVING': 2, 'SERVICE_UNKNOWN': 5,
                  'UNKNOWN': 2, 'UNAVAILABLE': 14, 'OK': 0}
 try:
@@ -217,7 +191,6 @@ try:
             for p in h.get('Percentiles', []) if 'Percentile' in p and 'Value' in p}
     p50_ms = pcts.get(50.0, avg_ms)
     codes = d.get('RetCodes') or {}
-    # Dominant key — may be string ('SERVING') or numeric ('0')
     raw_code = sorted(codes.items(), key=lambda x: -x[1])[0][0] if codes else 0
     try:
         numeric_code = int(raw_code)
@@ -230,11 +203,9 @@ except Exception as e:
 " 2>/dev/null || true)
 
       elif [ "${proto}" = "grpc" ]; then
-        # gRPC probing disabled (pre-flight failed) — skip silently
-        probe=""
+        probe=""  # gRPC disabled — skip silently
 
       elif [ "${http_pod}" = "fortio-loadgen" ]; then
-        # ── HTTP probe via fortio (no curl available in fortio image) ────────
         source_pod="${http_pod}"
         source_node="${http_node}"
         local raw
@@ -248,7 +219,6 @@ try:
     avg_ms = float(h.get('Avg', 0)) * 1000
     codes = d.get('RetCodes') or {}
     code = sorted(codes.items(), key=lambda x: -x[1])[0][0] if codes else 0
-    # Approximate timing breakdown (fortio HTTP does not expose dns/connect/ttfb separately)
     print('dns=0 connect={:.2f} ttfb={:.2f} total={:.2f} code={}'.format(
         avg_ms * 0.05, avg_ms * 0.6, avg_ms, int(code)))
 except Exception:
@@ -256,8 +226,6 @@ except Exception:
 " 2>/dev/null || true)
 
       else
-        # ── HTTP probe via curl (s2s-prober pod — gives full timing breakdown) ──
-        # curl write-out fields are in seconds; convert to ms.
         source_pod="${http_pod}"
         source_node="${http_node}"
         probe=$(kubectl --kubeconfig "${KUBECONFIG_PATH}" exec "${http_pod}" -- \
@@ -292,6 +260,7 @@ print(' '.join(out))
   done
 }
 
+# ── Background monitor loop ───────────────────────────────────────────────────
 monitor_loop() {
   while [ ! -f "${NET_DIR}/.monitor-stop" ]; do
     local ts
@@ -303,140 +272,124 @@ monitor_loop() {
 
 : > "${S2S_FILE}"
 : > "${NET_DIR}/monitoring.log"
-echo "Starting telemetry monitoring in background (interval=${SAMPLE_INTERVAL}s)..."
-# One initial probe — output goes to monitoring.log so errors are captured
+echo "Starting telemetry monitoring (interval=${SAMPLE_INTERVAL}s)..."
 ts0="$(date +"%Y%m%d-%H%M%S")"
 ( set +e; probe_service_latencies "${ts0}" "${TARGET_SERVICES_CSV}"; ) >> "${NET_DIR}/monitoring.log" 2>&1
 monitor_loop >> "${NET_DIR}/monitoring.log" 2>&1 &
 MONITOR_PID=$!
 
+# ── Burst plan ────────────────────────────────────────────────────────────────
 echo "Generating burst plan..."
 python3 - <<'PY' > "${META_FILE}"
-import json
-import os
-import random
-import time
+import json, os, random, time
 
-bursts = int(os.environ["BURSTS"])
-min_dur = int(os.environ["BASE_BURST_SECONDS"])
-max_dur = int(os.environ["MAX_BURST_SECONDS"])
-min_sleep = int(os.environ.get("MIN_SLEEP_SECONDS", "2"))
-max_sleep = int(os.environ["MAX_SLEEP_SECONDS"])
-# Ensure valid ranges (randint requires min <= max)
-min_dur, max_dur = min(min_dur, max_dur), max(min_dur, max_dur)
+bursts      = int(os.environ["BURSTS"])
+min_dur     = int(os.environ["BASE_BURST_SECONDS"])
+max_dur     = int(os.environ["MAX_BURST_SECONDS"])
+min_sleep   = int(os.environ.get("MIN_SLEEP_SECONDS", "2"))
+max_sleep   = int(os.environ["MAX_SLEEP_SECONDS"])
+min_dur,  max_dur   = min(min_dur,  max_dur),  max(min_dur,  max_dur)
 min_sleep, max_sleep = min(min_sleep, max_sleep), max(min_sleep, max_sleep)
-qps_floor = int(os.environ["QPS_FLOOR"])
-qps_ceil = int(os.environ["QPS_CEIL"])
-qps_floor, qps_ceil = min(qps_floor, qps_ceil), max(qps_floor, qps_ceil)
-spike_prob = float(os.environ["SPIKE_PROBABILITY"])
-
-w_home = float(os.environ["WEIGHT_HOME"])
-w_prod = float(os.environ["WEIGHT_PRODUCT"])
-w_cart = float(os.environ["WEIGHT_CART"])
-total_weight = w_home + w_prod + w_cart
+qps_floor   = int(os.environ["QPS_FLOOR"])
+qps_ceil    = int(os.environ["QPS_CEIL"])
+qps_floor,  qps_ceil = min(qps_floor, qps_ceil), max(qps_floor, qps_ceil)
+spike_prob  = float(os.environ["SPIKE_PROBABILITY"])
+w_home      = float(os.environ["W_HOME"])
+w_product   = float(os.environ["W_PRODUCT"])
+w_cart      = float(os.environ["W_CART"])
+w_checkout  = float(os.environ["W_CHECKOUT"])
 
 random.seed(int(time.time()))
-
 for i in range(bursts):
-    # Heavy-tail baseline + occasional extreme spike.
     if random.random() < spike_prob:
-        total_qps = random.randint(int(0.8 * qps_ceil), qps_ceil)
+        total_qps  = random.randint(int(0.8 * qps_ceil), qps_ceil)
         burst_type = "spike"
     else:
-        pareto = random.paretovariate(1.25)
-        total_qps = min(qps_ceil, max(qps_floor, int(qps_floor * pareto)))
+        pareto     = random.paretovariate(1.25)
+        total_qps  = min(qps_ceil, max(qps_floor, int(qps_floor * pareto)))
         burst_type = "heavy_tail"
-
-    duration = random.randint(min_dur, max_dur)
-    sleep_s = random.randint(min_sleep, max_sleep)
-
-    q_home = max(1, int(total_qps * (w_home / total_weight)))
-    q_prod = max(1, int(total_qps * (w_prod / total_weight)))
-    q_cart = max(1, total_qps - q_home - q_prod)
-
     print(json.dumps({
         "burst_index": i,
         "burst_type":  burst_type,
         "total_qps":   total_qps,
-        "duration_s":  duration,
-        "sleep_s":     sleep_s,
-        "qps_home":    q_home,
-        "qps_product": q_prod,
-        "qps_cart":    q_cart
+        "duration_s":  random.randint(min_dur,   max_dur),
+        "sleep_s":     random.randint(min_sleep, max_sleep),
+        "w_home":      w_home,
+        "w_product":   w_product,
+        "w_cart":      w_cart,
+        "w_checkout":  w_checkout,
     }))
 PY
 
+# ── Burst execution ───────────────────────────────────────────────────────────
 echo ""
 echo "Executing burst schedule..."
-echo "Targeting endpoints concurrently each burst for backend-wide pressure."
 
 while IFS= read -r burst; do
-  idx=$(echo "${burst}" | python3 -c 'import json,sys; print(json.load(sys.stdin)["burst_index"])')
-  burst_type=$(echo "${burst}" | python3 -c 'import json,sys; print(json.load(sys.stdin)["burst_type"])')
-  total_qps=$(echo "${burst}" | python3 -c 'import json,sys; print(json.load(sys.stdin)["total_qps"])')
-  duration_s=$(echo "${burst}" | python3 -c 'import json,sys; print(json.load(sys.stdin)["duration_s"])')
-  sleep_s=$(echo "${burst}" | python3 -c 'import json,sys; print(json.load(sys.stdin)["sleep_s"])')
-  qps_home=$(echo "${burst}" | python3 -c 'import json,sys; print(json.load(sys.stdin)["qps_home"])')
-  qps_product=$(echo "${burst}" | python3 -c 'import json,sys; print(json.load(sys.stdin)["qps_product"])')
-  qps_cart=$(echo "${burst}" | python3 -c 'import json,sys; print(json.load(sys.stdin)["qps_cart"])')
+  idx=$(        echo "${burst}" | python3 -c 'import json,sys; print(json.load(sys.stdin)["burst_index"])')
+  burst_type=$( echo "${burst}" | python3 -c 'import json,sys; print(json.load(sys.stdin)["burst_type"])')
+  total_qps=$(  echo "${burst}" | python3 -c 'import json,sys; print(json.load(sys.stdin)["total_qps"])')
+  duration_s=$( echo "${burst}" | python3 -c 'import json,sys; print(json.load(sys.stdin)["duration_s"])')
+  sleep_s=$(    echo "${burst}" | python3 -c 'import json,sys; print(json.load(sys.stdin)["sleep_s"])')
+  w_home=$(     echo "${burst}" | python3 -c 'import json,sys; print(json.load(sys.stdin)["w_home"])')
+  w_product=$(  echo "${burst}" | python3 -c 'import json,sys; print(json.load(sys.stdin)["w_product"])')
+  w_cart=$(     echo "${burst}" | python3 -c 'import json,sys; print(json.load(sys.stdin)["w_cart"])')
+  w_checkout=$( echo "${burst}" | python3 -c 'import json,sys; print(json.load(sys.stdin)["w_checkout"])')
 
-  echo "Burst ${idx} [${burst_type}] total_qps=${total_qps} duration=${duration_s}s sleep=${sleep_s}s"
-  echo "  split: home=${qps_home}, product=${qps_product}, cart=${qps_cart}"
+  echo "Burst ${idx} [${burst_type}] qps=${total_qps} duration=${duration_s}s sleep=${sleep_s}s"
 
-  kubectl --kubeconfig "${KUBECONFIG_PATH}" exec fortio-loadgen -- \
-    fortio load -qps "${qps_home}" -c "${THREADS_PER_ENDPOINT}" -t "${duration_s}s" \
-    -p "50,90,95,99,99.9" -abort-on -1 -allow-initial-errors -json - \
-    -labels "burst-${idx}-home-${burst_type}" "${HOME_URL}" \
-    > "${LOAD_DIR}/fortio-burst-${idx}-home.json" 2> "${LOAD_DIR}/fortio-burst-${idx}-home.log" &
-  p1=$!
+  # Run k6 on the load generator pod.
+  # k6 writes its per-endpoint summary to /tmp/k6-burst-{idx}.json on the pod.
+  kubectl --kubeconfig "${KUBECONFIG_PATH}" exec k6-loadgen -- \
+    k6 run \
+      -e TOTAL_QPS="${total_qps}" \
+      -e DURATION="${duration_s}s" \
+      -e W_HOME="${w_home}" \
+      -e W_PRODUCT="${w_product}" \
+      -e W_CART="${w_cart}" \
+      -e W_CHECKOUT="${w_checkout}" \
+      -e BURST_INDEX="${idx}" \
+      -e BURST_TYPE="${burst_type}" \
+      --no-usage-report \
+      /tmp/k6-load-test.js \
+    > "${LOAD_DIR}/k6-burst-${idx}.log" 2>&1
 
-  kubectl --kubeconfig "${KUBECONFIG_PATH}" exec fortio-loadgen -- \
-    fortio load -qps "${qps_product}" -c "${THREADS_PER_ENDPOINT}" -t "${duration_s}s" \
-    -p "50,90,95,99,99.9" -abort-on -1 -allow-initial-errors -json - \
-    -labels "burst-${idx}-product-${burst_type}" "${PRODUCT_URL}" \
-    > "${LOAD_DIR}/fortio-burst-${idx}-product.json" 2> "${LOAD_DIR}/fortio-burst-${idx}-product.log" &
-  p2=$!
+  # Copy the summary JSON back from the pod
+  kubectl --kubeconfig "${KUBECONFIG_PATH}" cp \
+    "k6-loadgen:/tmp/k6-burst-${idx}.json" \
+    "${LOAD_DIR}/k6-burst-${idx}.json" 2>/dev/null || \
+    echo "  ⚠ Could not retrieve k6-burst-${idx}.json from pod"
 
-  kubectl --kubeconfig "${KUBECONFIG_PATH}" exec fortio-loadgen -- \
-    fortio load -qps "${qps_cart}" -c "${THREADS_PER_ENDPOINT}" -t "${duration_s}s" \
-    -p "50,90,95,99,99.9" -abort-on -1 -allow-initial-errors -json - \
-    -labels "burst-${idx}-cart-${burst_type}" "${CART_URL}" \
-    > "${LOAD_DIR}/fortio-burst-${idx}-cart.json" 2> "${LOAD_DIR}/fortio-burst-${idx}-cart.log" &
-  p3=$!
-
-  wait "${p1}" "${p2}" "${p3}"
-
-  # Additional immediate sample right after each burst.
+  # Immediate telemetry snapshot after each burst
   capture_cluster_snapshot "$(date +"%Y%m%d-%H%M%S")"
   sleep "${sleep_s}"
 done < "${META_FILE}"
 
+# ── Cleanup ───────────────────────────────────────────────────────────────────
 touch "${NET_DIR}/.monitor-stop"
 wait "${MONITOR_PID}" || true
 rm -f "${NET_DIR}/.monitor-stop"
 
-# Warn if no s2s data (graphs 07-11 need this)
 s2s_lines=$(wc -l < "${S2S_FILE}" 2>/dev/null || echo "0")
 if [ "${s2s_lines}" -eq 0 ]; then
   echo ""
-  echo "⚠ WARNING: service-to-service-latency.jsonl is empty. Graphs 07-11 will not be generated."
-  echo "  Check: kubectl get pod fortio-loadgen; kubectl get pod -l app=s2s-prober"
-  echo "  Test:  kubectl exec <s2s-prober-pod> -- curl -s -o /dev/null -w '%{http_code}' http://frontend:80/"
-  echo "  Log:   ${NET_DIR}/monitoring.log"
-  echo ""
+  echo "⚠ WARNING: service-to-service-latency.jsonl is empty. Graphs 07-11 skipped."
+  echo "  Log: ${NET_DIR}/monitoring.log"
 fi
 
 kubectl --kubeconfig "${KUBECONFIG_PATH}" get hpa -o wide > "${NET_DIR}/hpa-after.txt" || true
-kubectl --kubeconfig "${KUBECONFIG_PATH}" get events -n default --sort-by='.lastTimestamp' > "${NET_DIR}/events-scaling.txt" || true
+kubectl --kubeconfig "${KUBECONFIG_PATH}" get events -n default --sort-by='.lastTimestamp' \
+  > "${NET_DIR}/events-scaling.txt" || true
 
 echo ""
 echo "=========================================="
 echo "Test Complete"
 echo "=========================================="
-echo "Burst metadata: ${META_FILE}"
-echo "Fortio outputs: ${LOAD_DIR}/fortio-burst-*-{home,product,cart}.json"
+echo "Run ID:            ${RUN_ID}"
+echo "k6 burst outputs:  ${LOAD_DIR}/k6-burst-*.json"
+echo "k6 logs:           ${LOAD_DIR}/k6-burst-*.log"
 echo "Network telemetry: ${NET_DIR}"
 echo ""
 echo "Next:"
-echo "  ./07-analyze-network-data.py data/${RUN_ID}"
+echo "  python3 06-generate-graphs.py data/${RUN_ID}"
 echo ""
