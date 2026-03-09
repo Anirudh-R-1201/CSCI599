@@ -180,7 +180,7 @@ export function handleSummary(data) {
     };
   }
 
-  // Add request counts from http_reqs metric
+  // Add request counts and actual QPS from http_reqs metric
   for (const [key, metric] of Object.entries(data.metrics || {})) {
     if (!key.startsWith('http_reqs')) continue;
     const nameMatch = key.match(/\{.*?name:([^,}]+)/);
@@ -188,6 +188,15 @@ export function handleSummary(data) {
     if (!endpoints[ep]) continue;
     endpoints[ep].count      = (metric.values || {}).count || 0;
     endpoints[ep].actual_qps = (metric.values || {}).rate  || 0;
+  }
+
+  // Add error rate from http_req_failed metric (Rate: fraction of non-2xx responses)
+  for (const [key, metric] of Object.entries(data.metrics || {})) {
+    if (!key.startsWith('http_req_failed')) continue;
+    const nameMatch = key.match(/\{.*?name:([^,}]+)/);
+    const ep = nameMatch ? nameMatch[1] : 'all';
+    if (!endpoints[ep]) continue;
+    endpoints[ep].error_rate = (metric.values || {}).rate || 0;
   }
 
   const summary = {

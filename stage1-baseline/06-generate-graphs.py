@@ -39,8 +39,32 @@ BOUTIQUE_CALL_GRAPH = {
     "cartservice": ["redis-cart"],
 }
 
-ENDPOINT_COLORS = {"cart": "#2166ac", "home": "#d6604d", "product": "#4dac26", "all": "#666666"}
-ENDPOINT_ORDER  = ["cart", "home", "product"]
+ENDPOINT_COLORS = {
+    "cart":     "#2166ac",
+    "home":     "#d6604d",
+    "product":  "#4dac26",
+    "checkout": "#7b2d8b",
+    "all":      "#666666",
+}
+ENDPOINT_ORDER = ["cart", "home", "product", "checkout"]
+
+# Service-name abbreviation map shared across graph 07, 08, and friends
+SVC_ABBREV = {
+    "productcatalogservice": "catalog",
+    "recommendationservice": "recommend",
+    "checkoutservice":       "checkout",
+    "paymentservice":        "payment",
+    "shippingservice":       "shipping",
+    "currencyservice":       "currency",
+    "emailservice":          "email",
+    "cartservice":           "cart",
+    "adservice":             "ads",
+    "frontend":              "frontend",
+    "redis-cart":            "redis-cart",
+}
+
+def _abbrev_svc(name):
+    return SVC_ABBREV.get(name, name)
 
 BOUTIQUE_SERVICES = [
     "frontend", "productcatalogservice", "recommendationservice", "cartservice",
@@ -68,6 +92,7 @@ def _parse_fortio_burst_file(file_path, burst_index, endpoint):
     return {
         "file":          os.path.basename(file_path),
         "index":         burst_index,
+        "burst_type":    "unknown",
         "endpoint":      endpoint,
         "start_time":    data.get("StartTime", ""),
         "requested_qps": float(data.get("RequestedQPS", 0)),
@@ -80,6 +105,7 @@ def _parse_fortio_burst_file(file_path, burst_index, endpoint):
         "p999": percentiles.get(99.9, 0),
         "avg":  data.get("DurationHistogram", {}).get("Avg", 0),
         "count": data.get("DurationHistogram", {}).get("Count", 0),
+        "error_rate": 0.0,
         "conn_p50_ms":  conn_p50,
         "conn_p95_ms":  conn_p95,
         "conn_times_ms": [
@@ -112,12 +138,13 @@ def _parse_k6_burst_file(file_path):
         records.append({
             "file":          os.path.basename(file_path),
             "index":         burst_index,
+            "burst_type":    burst_type,
             "endpoint":      ep,
             "start_time":    "",
             "requested_qps": total_qps,
             "actual_qps":    stats.get("actual_qps", 0),
             "duration_s":    duration_s,
-            # k6 handleSummary stores values in seconds already
+            # k6 handleSummary stores latency in seconds
             "p50":  stats.get("p50",  0),
             "p90":  stats.get("p90",  0),
             "p95":  stats.get("p95",  0),
@@ -125,6 +152,8 @@ def _parse_k6_burst_file(file_path):
             "p999": stats.get("p999", 0),
             "avg":  stats.get("avg",  0),
             "count": int(stats.get("count", 0)),
+            # error_rate: fraction of requests that failed (0.0–1.0)
+            "error_rate": float(stats.get("error_rate", 0.0)),
             "conn_p50_ms":  None,
             "conn_p95_ms":  None,
             "conn_times_ms": [],
@@ -386,25 +415,93 @@ def _save(fig, output_dir, filename):
 # ---------------------------------------------------------------------------
 
 def plot_qps_comparison(bursts, output_dir, bursts_config=None):
-    """Bar chart: actual QPS per burst (total across all endpoints per burst index)."""
+    """Bar chart: actual QPS per burst colored by burst type (spike vs heavy_tail)."""
     # Sum actual_qps across all endpoints for each burst index
     by_index = defaultdict(float)
     for b in bursts:
         by_index[b["index"]] += b["actual_qps"]
 
+    # Build burst_type and requested_qps maps from bursts_config or burst records
+    burst_type_map = {}
+    requested_qps_map = {}
+    if bursts_config:
+        for row in bursts_config:
+            idx = row.get("burst_index", row.get("index"))
+            if idx is not None:
+                burst_type_map[idx] = row.get("burst_type", "unknown")
+                requested_qps_map[idx] = row.get("total_qps", row.get("requested_qps", 0))
+    if not burst_type_map:
+        # Fall back to per-burst record metadata (k6 records carry burst_type)
+        seen = {}
+        for b in bursts:
+            idx = b["index"]
+            if idx not in seen:
+                seen[idx] = b.get("burst_type", "unknown")
+                burst_type_map[idx] = seen[idx]
+                requested_qps_map[idx] = b.get("requested_qps", 0)
+
     all_indices = sorted(by_index.keys())
     x = np.arange(len(all_indices))
     vals = [by_index[i] for i in all_indices]
 
+    SPIKE_COLOR      = "#e08d1e"   # amber
+    HEAVY_TAIL_COLOR = "#4393c3"   # steel blue
+    UNKNOWN_COLOR    = "#888888"
+
+    bar_colors = []
+    for idx in all_indices:
+        bt = burst_type_map.get(idx, "unknown")
+        if "spike" in bt:
+            bar_colors.append(SPIKE_COLOR)
+        elif "heavy" in bt or "tail" in bt:
+            bar_colors.append(HEAVY_TAIL_COLOR)
+        else:
+            bar_colors.append(UNKNOWN_COLOR)
+
     fig, ax = plt.subplots(figsize=(14, 6))
-    ax.bar(x, vals, alpha=0.8, color="#4393c3", label="Actual QPS")
+    bars = ax.bar(x, vals, color=bar_colors, alpha=0.85, zorder=2)
+
+    # Configured QPS line — use secondary Y axis when configured >> actual
+    import matplotlib.patches as mpatches
+    import matplotlib.lines as mlines
+    spike_patch      = mpatches.Patch(color=SPIKE_COLOR,      alpha=0.85, label="Spike burst")
+    heavy_tail_patch = mpatches.Patch(color=HEAVY_TAIL_COLOR, alpha=0.85, label="Heavy-tail burst")
+    handles = [spike_patch, heavy_tail_patch]
+
+    if requested_qps_map:
+        req_vals  = [requested_qps_map.get(i, None) for i in all_indices]
+        valid     = [(xi, v) for xi, v in zip(x, req_vals) if v]
+        max_req   = max(v for _, v in valid) if valid else 0
+        max_act   = max(vals) if vals else 1
+
+        if valid:
+            xs_v, ys_v = zip(*valid)
+            if max_req > max_act * 2:
+                # Large mismatch (cluster saturated) — secondary axis so bars stay readable
+                ax2 = ax.twinx()
+                ax2.step(xs_v, ys_v, where="mid", color="#c0392b", linewidth=1.5,
+                         linestyle="--", alpha=0.7, zorder=3)
+                ax2.set_ylabel("Configured QPS (target)", fontsize=10, color="#c0392b")
+                ax2.tick_params(axis="y", colors="#c0392b")
+                cfg_line = mlines.Line2D([], [], color="#c0392b", linestyle="--",
+                                         linewidth=1.5, label="Configured QPS (right axis)")
+            else:
+                ax.step(xs_v, ys_v, where="mid", color="#c0392b", linewidth=1.5,
+                        linestyle="--", alpha=0.7, zorder=3)
+                cfg_line = mlines.Line2D([], [], color="#c0392b", linestyle="--",
+                                         linewidth=1.5, label="Configured QPS")
+            handles.append(cfg_line)
+
+    ax.legend(handles=handles, fontsize=10, loc="lower right")
 
     ax.set_xlabel("Burst index", fontsize=12)
     ax.set_ylabel("Queries per second (QPS)", fontsize=12)
-    ax.set_title("1. Load: actual QPS per burst", fontsize=14, fontweight="bold")
-    ax.set_xticks(x[::2])
-    ax.set_xticklabels([str(all_indices[i]) for i in range(0, len(all_indices), 2)])
-    ax.grid(True, alpha=0.3, axis="y")
+    ax.set_title("1. Load: actual QPS per burst\n"
+                 "(Amber = spike; blue = heavy-tail; dashed = configured target)",
+                 fontsize=13, fontweight="bold")
+    ax.set_xticks(x)
+    ax.set_xticklabels([str(i) for i in all_indices], fontsize=9)
+    ax.grid(True, alpha=0.3, axis="y", zorder=0)
     plt.tight_layout()
     _save(fig, output_dir, "01_qps_comparison.png")
 
@@ -746,36 +843,43 @@ def plot_cross_node_ratio(s2s_records, service_to_nodes, output_dir,
         print("⚠ No east-west data computed, skipping graph 07")
         return
 
-    # Average and sort descending
-    edges_avg = {edge: sum(v) / len(v) * 100 for edge, v in results.items()}
+    # Use the module-level abbreviation helper
+    _s = _abbrev_svc
+
+    # Average over all snapshots and sort descending
+    edges_avg    = {edge: sum(v) / len(v) * 100 for edge, v in results.items()}
     edges_sorted = sorted(edges_avg.items(), key=lambda x: -x[1])
 
-    labels   = [f"{c}\n→{t}" for (c, t), _ in edges_sorted]
-    ratios   = [v for _, v in edges_sorted]
-    colors   = ["#d73027" if r > 75 else "#fc8d59" if r > 40 else "#91bfdb" for r in ratios]
+    labels = [f"{_s(c)} → {_s(t)}" for (c, t), _ in edges_sorted]
+    ratios = [v for _, v in edges_sorted]
+    colors = ["#d73027" if r > 75 else "#fc8d59" if r > 40 else "#91bfdb" for r in ratios]
 
-    fig, ax = plt.subplots(figsize=(max(12, len(labels) * 0.85), 6))
-    bars = ax.bar(range(len(labels)), ratios, color=colors, alpha=0.88, width=0.65)
-    ax.axhline(50,  color="red",    linestyle="--", linewidth=1, alpha=0.5, label="50% threshold")
-    ax.axhline(100, color="#8b0000", linestyle=":", linewidth=1, alpha=0.4, label="100% (always cross-node)")
+    # Horizontal bar chart — Y-axis has room for long labels, no rotation needed
+    n = len(labels)
+    fig, ax = plt.subplots(figsize=(9, max(5, n * 0.42)))
+    y_pos = range(n)
 
-    # Annotate bar values
-    for i, (bar, r) in enumerate(zip(bars, ratios)):
-        ax.text(bar.get_x() + bar.get_width() / 2, r + 1.5, f"{r:.0f}%",
-                ha="center", va="bottom", fontsize=7, color="#333333")
+    bars = ax.barh(y_pos, ratios, color=colors, alpha=0.88, height=0.65)
+    ax.axvline(50,  color="red",     linestyle="--", linewidth=1, alpha=0.5, label="50% threshold")
+    ax.axvline(100, color="#8b0000", linestyle=":",  linewidth=1, alpha=0.4, label="100% (always cross-node)")
 
-    ax.set_xticks(range(len(labels)))
-    ax.set_xticklabels(labels, fontsize=8)
-    ax.set_ylabel("Expected cross-node calls (%)", fontsize=12)
-    ax.set_ylim(0, 115)
+    # Value labels at end of each bar
+    for bar, r in zip(bars, ratios):
+        ax.text(min(r + 1.5, 103), bar.get_y() + bar.get_height() / 2,
+                f"{r:.0f}%", va="center", ha="left", fontsize=8, color="#333333")
+
+    ax.set_yticks(y_pos)
+    ax.set_yticklabels(labels, fontsize=9)
+    ax.set_xlim(0, 115)
+    ax.set_xlabel("Expected cross-node calls (%)", fontsize=11)
+    ax.invert_yaxis()   # highest fraction at top
     ax.set_title(
         "7. East-West Traffic: expected cross-node fraction per service-to-service RPC\n"
-        "(Based on actual call graph + K8s endpoint placement; "
-        "assumes uniform load balancing)\n"
+        "(Actual call graph + K8s endpoint placement; uniform load balancing assumed)\n"
         "Red >75% · Orange 40–75% · Blue <40%",
-        fontsize=11, fontweight="bold")
-    ax.legend(fontsize=9)
-    ax.grid(True, alpha=0.3, axis="y")
+        fontsize=10, fontweight="bold")
+    ax.legend(fontsize=9, loc="lower right")
+    ax.grid(True, alpha=0.3, axis="x")
     plt.tight_layout()
     _save(fig, output_dir, "07_cross_node_ratio.png")
 
@@ -826,7 +930,7 @@ def plot_same_vs_cross_node_cdf(s2s_records, service_to_nodes, output_dir,
     n_snaps = max(len(v) for v in edges_to_plot.values())
     xs = list(range(n_snaps))
 
-    fig, axes = plt.subplots(1, 2, figsize=(16, 6), sharey=True,
+    fig, axes = plt.subplots(1, 2, figsize=(16, 7),
                               gridspec_kw={"width_ratios": [3, 1]})
     ax_main, ax_bar = axes
 
@@ -837,7 +941,7 @@ def plot_same_vs_cross_node_cdf(s2s_records, service_to_nodes, output_dir,
             avg = sum(vals) / len(vals) * 100
             ax_main.plot(range(len(vals)), [v * 100 for v in vals],
                          linewidth=2, alpha=0.85, color=color,
-                         label=f"{edge[0]}→{edge[1]} (avg {avg:.0f}%)")
+                         label=f"{_abbrev_svc(edge[0])}→{_abbrev_svc(edge[1])} (avg {avg:.0f}%)")
     else:
         ax_main.text(0.5, 0.5, "No dynamic edges\n(all edges are constant 0% or 100%)",
                      ha="center", va="center", transform=ax_main.transAxes, fontsize=11)
@@ -847,7 +951,11 @@ def plot_same_vs_cross_node_cdf(s2s_records, service_to_nodes, output_dir,
     ax_main.set_ylim(-5, 110)
     ax_main.set_title("Dynamic edges (fraction varies as HPA scales pods)", fontsize=10)
     ax_main.axhline(50, color="grey", linestyle="--", linewidth=0.8, alpha=0.5)
-    ax_main.legend(fontsize=8, loc="upper right", ncol=1)
+    # Two-column legend placed below the plot to avoid crowding the data area
+    ax_main.legend(fontsize=7.5, ncol=2,
+                   loc="upper center", bbox_to_anchor=(0.5, -0.14),
+                   framealpha=0.9, edgecolor="#cccccc",
+                   handlelength=1.6, columnspacing=1.0)
     ax_main.grid(True, alpha=0.3)
 
     # Right panel: summary bar for all edges
@@ -855,15 +963,18 @@ def plot_same_vs_cross_node_cdf(s2s_records, service_to_nodes, output_dir,
         [(edge, sum(v)/len(v)*100) for edge, v in edges_to_plot.items()],
         key=lambda x: -x[1]
     )
-    bar_labels = [f"{c}→{t}" for (c, t), _ in all_edges_avg]
+    bar_labels = [f"{_abbrev_svc(c)}→{_abbrev_svc(t)}" for (c, t), _ in all_edges_avg]
     bar_vals   = [v for _, v in all_edges_avg]
     bar_colors = ["#d73027" if v > 75 else "#fc8d59" if v > 40 else "#91bfdb"
                   for v in bar_vals]
-    y_pos = range(len(bar_labels))
+    n_edges = len(bar_labels)
+    y_pos = np.arange(n_edges)
     ax_bar.barh(y_pos, bar_vals, color=bar_colors, alpha=0.85, height=0.65)
     ax_bar.set_yticks(y_pos)
     ax_bar.set_yticklabels(bar_labels, fontsize=8)
     ax_bar.set_xlim(0, 115)
+    ax_bar.set_ylim(-0.5, n_edges - 0.5)
+    ax_bar.invert_yaxis()
     ax_bar.set_xlabel("Avg cross-node %", fontsize=9)
     ax_bar.axvline(50, color="grey", linestyle="--", linewidth=0.8, alpha=0.5)
     ax_bar.set_title("Avg over experiment", fontsize=10)
@@ -877,6 +988,8 @@ def plot_same_vs_cross_node_cdf(s2s_records, service_to_nodes, output_dir,
         fontsize=11, fontweight="bold"
     )
     plt.tight_layout()
+    # Extra bottom margin for the below-axis legend
+    fig.subplots_adjust(bottom=0.18)
     _save(fig, output_dir, "08_same_vs_cross_node_cdf.png")
 
 
@@ -896,6 +1009,10 @@ def plot_p95_vs_replicas(latency_replicas_rows, output_dir):
         try:
             p95 = float(p95_str)
         except ValueError:
+            continue
+        # Skip near-zero values — these come from gRPC health probes that respond in <1ms
+        # and don't reflect real application latency; they skew the scatter to the bottom.
+        if p95 < 10:
             continue
         cur = sum(int(v) for k, v in row.items()
                   if k.endswith("_current") and v and v.isdigit())
@@ -1260,8 +1377,9 @@ def plot_network_rtt_only(s2s_records, output_dir, from_loadgen_only=False):
 # ---------------------------------------------------------------------------
 
 def plot_connect_time_cdf(bursts, output_dir):
-    """CDF of TCP connection establishment time (from fortio ConnectionStats).
-    Reveals the bimodal distribution: fast same-node/cached-DNS vs slow DNS-lookup mode.
+    """CDF of TCP connection establishment time from the s2s HTTP prober (fortio ConnectionStats).
+    Reveals bimodal distribution: fast same-node/cached-DNS vs slow live-DNS mode.
+    k6 load-test bursts don't carry connection timing, so this graph always uses prober data.
     """
     all_times = []
     for b in bursts:
@@ -1281,7 +1399,7 @@ def plot_connect_time_cdf(bursts, output_dir):
         ax.scatter(range(len(p95s)), p95s, label="conn p95 (ms)", s=40, color="#d6604d", marker="s")
         ax.set_xlabel("Burst index", fontsize=12)
         ax.set_ylabel("Connection time (ms)", fontsize=12)
-        ax.set_title("12. Connection time p50/p95 per burst (bimodal: fast vs slow DNS)",
+        ax.set_title("12. s2s prober connection time p50/p95 per burst (bimodal: fast vs slow DNS)",
                      fontsize=13, fontweight="bold")
         ax.legend()
         ax.grid(True, alpha=0.3)
@@ -1323,7 +1441,7 @@ def plot_connect_time_cdf(bursts, output_dir):
     ax2.set_ylim(0, 1.05)
     ax2.grid(True, alpha=0.3)
 
-    fig.suptitle("12. Connection-time distribution (all fortio connections)\n"
+    fig.suptitle("12. Connection-time distribution (s2s HTTP prober — TCP connect time)\n"
                  "Bimodal: fast mode = cached DNS / same-node path; "
                  "slow mode = live CoreDNS resolution under load",
                  fontsize=13, fontweight="bold")
@@ -1466,6 +1584,62 @@ def plot_per_endpoint_latency(bursts, output_dir):
     ax.grid(True, alpha=0.3, axis="y")
     plt.tight_layout()
     _save(fig, output_dir, "14_per_endpoint_latency.png")
+
+
+# ---------------------------------------------------------------------------
+# Graph 15 – k6 per-endpoint error rate per burst
+# ---------------------------------------------------------------------------
+
+def plot_k6_error_rate(bursts, output_dir):
+    """Graph 15: per-endpoint HTTP error rate (fraction of failed requests) over bursts.
+
+    Only meaningful for k6 bursts — fortio burst records carry error_rate=0.0.
+    Skipped if no endpoint has any non-zero error rate.
+    """
+    by_ep = defaultdict(dict)
+    for b in bursts:
+        er = b.get("error_rate", 0.0)
+        if er is not None:
+            by_ep[b["endpoint"]][b["index"]] = er
+
+    # Only include endpoints that actually have error data
+    endpoints = [e for e in ENDPOINT_ORDER if e in by_ep]
+    if not endpoints:
+        endpoints = sorted(by_ep.keys())
+
+    # Skip graph entirely if all error rates are zero across all endpoints
+    all_zero = all(
+        v == 0.0
+        for ep in endpoints
+        for v in by_ep[ep].values()
+    )
+    if all_zero:
+        print("⚠ All error rates are 0 — skipping graph 15")
+        return
+
+    all_idx = sorted({b["index"] for b in bursts})
+    fig, ax = plt.subplots(figsize=(14, 5))
+
+    for ep in endpoints:
+        idx_map = by_ep[ep]
+        idx_list = sorted(idx_map.keys())
+        rates = [idx_map[i] * 100 for i in idx_list]  # fraction → %
+        color = ENDPOINT_COLORS.get(ep, "#666")
+        ax.plot(idx_list, rates, "o-", color=color, linewidth=2, markersize=5, label=f"/{ep}")
+
+    ax.axhline(1.0, color="red", linestyle="--", linewidth=1, alpha=0.6, label="1% threshold")
+    ax.set_xlabel("Burst index", fontsize=12)
+    ax.set_ylabel("HTTP error rate (%)", fontsize=12)
+    ax.set_title(
+        "15. Per-endpoint HTTP error rate over bursts (k6)\n"
+        "(Non-2xx responses as % of total; high error rate = cluster saturation or service crash)",
+        fontsize=13, fontweight="bold"
+    )
+    ax.set_ylim(bottom=0)
+    ax.legend(fontsize=11)
+    ax.grid(True, alpha=0.3)
+    plt.tight_layout()
+    _save(fig, output_dir, "15_k6_error_rate.png")
 
 
 # ---------------------------------------------------------------------------
@@ -1641,10 +1815,11 @@ def main():
     _plot("11", plot_queueing_vs_rtt,           s2s_for_net, output_dir, from_loadgen_only=from_lg_only)
     _plot("11b", plot_network_rtt_only,         s2s_for_net, output_dir, from_loadgen_only=from_lg_only)
 
-    print("\nGenerating new graphs 12–14...")
+    print("\nGenerating new graphs 12–15...")
     _plot("12", plot_connect_time_cdf,     bursts, output_dir)
     _plot("13", plot_hpa_latency_timeline, bursts, latency_rows, output_dir)
     _plot("14", plot_per_endpoint_latency, bursts, output_dir)
+    _plot("15", plot_k6_error_rate,        bursts, output_dir)
 
     # Update README
     readme = os.path.join(output_dir, "README.txt")
@@ -1667,6 +1842,7 @@ def main():
         f.write("  11b_network_rtt_only.png           – Connect-time time-series + CDF (bimodal split)\n")
         f.write("  12_connect_time_cdf.png            – Connection-time distribution: fast (<5ms) vs slow (DNS)\n\n")
         f.write("  (Graphs 10/10b skipped: only useful when probes come from multiple source nodes)\n\n")
+        f.write("  15_k6_error_rate.png               – Per-endpoint HTTP error rate per burst (k6 only)\n")
         f.write("  summary_stats.txt                  – Numeric summary\n")
     print(f"✓ Generated: {readme}")
     print(f"\n✓ All graphs written to: {output_dir}")
