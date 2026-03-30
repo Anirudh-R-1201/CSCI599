@@ -1275,17 +1275,29 @@ def plot_queueing_vs_rtt(s2s_records, output_dir, from_loadgen_only=False):
     title = "11. Decomposition: network RTT vs server queueing delay over time"
     title += " (load generator)" if from_loadgen_only else " (client prober → service)"
 
-    # Clamp zeros to a small positive value so log scale works on stackplot
+    # Clamp zeros to a small positive value so log scale works.
+    # Use fill_between instead of stackplot: stackplot adds values linearly before
+    # the log transform is applied, so log-scale gridlines (10, 100, 1000 ms) cut
+    # through areas at arbitrary visual positions unrelated to the data.
+    # fill_between anchors each area to actual values on the log scale.
     eps = 0.01
     mean_connect_log  = [max(v, eps) for v in mean_connect]
-    mean_queueing_log = [max(v, eps) for v in mean_queueing]
+    total_log         = [max(c + q, eps) for c, q in zip(mean_connect, mean_queueing)]
 
     fig, ax = plt.subplots(figsize=(14, 6))
-    ax.stackplot(x, mean_connect_log, mean_queueing_log,
-                 labels=["Network RTT (connect, includes DNS)",
-                         "Server queueing delay (ttfb − connect)"],
-                 colors=["#4393c3", "#d6604d"], alpha=0.85)
+    ax.fill_between(x, eps, mean_connect_log,
+                    alpha=0.85, color="#4393c3",
+                    label="Network RTT (connect, includes DNS)")
+    ax.fill_between(x, mean_connect_log, total_log,
+                    alpha=0.85, color="#d6604d",
+                    label="Server queueing delay (ttfb − connect)")
     ax.set_yscale("log")
+
+    # Add minor gridlines between decades so the scale is readable
+    import matplotlib.ticker as mticker
+    ax.yaxis.set_minor_locator(mticker.LogLocator(subs=[2, 3, 5]))
+    ax.yaxis.set_minor_formatter(mticker.NullFormatter())
+
     ax.set_xlabel("Probe snapshot (time order)", fontsize=12)
     ax.set_ylabel("Latency (ms, log scale)", fontsize=12)
     ax.set_title(title + "\n(Note: 'connect' time includes CoreDNS resolution — "

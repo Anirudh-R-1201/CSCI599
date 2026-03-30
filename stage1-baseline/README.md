@@ -4,7 +4,8 @@
 
 | File | Role |
 |---|---|
-| `01-run-experiment.sh` | Top-level runner |
+| `00-deploy-boutique.sh` | Deploy Online Boutique + probers (no traffic) |
+| `01-run-experiment.sh` | Top-level experiment runner |
 | `02-analyze-results.sh` | Top-level analyzer |
 | `03e-bursty-highload-network-test.sh` | Load generation + telemetry collection |
 | `k6-load-test.js` | k6 scenario script (stateful checkout, all endpoints) |
@@ -20,11 +21,83 @@
 ```bash
 cd ~/CSCI599/stage1-baseline
 
-# Full run: deploy, configure HPA, run load, collect telemetry
+# Step 1: Deploy Online Boutique (one-time, idempotent)
+./00-deploy-boutique.sh
+
+# Step 2: Run experiment
 MODE=full ./01-run-experiment.sh && ./02-analyze-results.sh
 
 # Approve CSRs in background (required on CloudLab)
 while true; do sleep 2 && kubectl get csr -o name | xargs kubectl certificate approve 2>/dev/null; done
+```
+
+## Baseline vs Topo-Aware Comparison Runs
+
+To produce a directly comparable pair of runs (same cluster, same hardware, only the LB policy differs):
+
+```bash
+# ── Baseline run (topo-aware OFF) ──────────────────────────────
+kubectl set env deployment/ovnkube-master -n ovn-kubernetes \
+  -c ovnkube-master OVN_ENABLE_TOPOLOGY_AWARE_LB=false
+kubectl rollout restart deployment/ovnkube-master -n ovn-kubernetes
+kubectl rollout status deployment/ovnkube-master -n ovn-kubernetes --timeout=120s
+
+# Reset replicas for a clean ramp-up
+kubectl scale deployment frontend productcatalogservice recommendationservice \
+  checkoutservice cartservice --replicas=1
+sleep 30
+
+# Recreate k6 pod fresh
+kubectl delete pod k6-loadgen --ignore-not-found
+kubectl apply -f k6-loadgen.yaml
+kubectl get pod k6-loadgen -w   # wait for Running
+
+MODE=full ./01-run-experiment.sh && ./02-analyze-results.sh
+# Note the RUN_ID printed — this is your baseline
+
+
+# ── Topo-aware run (topo-aware ON) ─────────────────────────────
+kubectl set env deployment/ovnkube-master -n ovn-kubernetes \
+  -c ovnkube-master OVN_ENABLE_TOPOLOGY_AWARE_LB=true
+kubectl rollout restart deployment/ovnkube-master -n ovn-kubernetes
+kubectl rollout status deployment/ovnkube-master -n ovn-kubernetes --timeout=120s
+
+# Verify topology-aware LBs are active
+DB_POD=$(kubectl get pod -n ovn-kubernetes -l name=ovnkube-db -o jsonpath='{.items[0].metadata.name}')
+kubectl exec -n ovn-kubernetes $DB_POD -- \
+  ovn-nbctl list load_balancer | grep "selection_fields" | sort | uniq -c
+# Expected: some show [ip_dst, ip_src]  ← topology-aware
+#           others show []              ← regular (kube-system services)
+
+# Reset replicas again for fair comparison
+kubectl scale deployment frontend productcatalogservice recommendationservice \
+  checkoutservice cartservice --replicas=1
+sleep 30
+
+kubectl delete pod k6-loadgen --ignore-not-found
+kubectl apply -f k6-loadgen.yaml
+sleep 5
+kubectl get pod k6-loadgen 
+
+MODE=full ./01-run-experiment.sh && ./02-analyze-results.sh
+# Note the RUN_ID printed — this is your topo-aware run
+```
+
+**What to compare across the two runs** (replace `<BASE>` and `<TOPO>` with actual RUN_IDs):
+
+```bash
+# Graph 07/08 — cross-node traffic fraction (key metric)
+# Lower bars in topo run = routing is preferring same-zone backends
+open data/<BASE>/graphs/07_cross_node_ratio.png
+open data/<TOPO>/graphs/07_cross_node_ratio.png
+
+# Graph 03 — latency vs QPS (lower p95/p99 in topo run = less east-west RTT)
+open data/<BASE>/graphs/03_latency_vs_qps.png
+open data/<TOPO>/graphs/03_latency_vs_qps.png
+
+# Graph 11 — queueing vs RTT (topo run should shift cluster to left = shorter RTTs)
+open data/<BASE>/graphs/11_queueing_vs_rtt.png
+open data/<TOPO>/graphs/11_queueing_vs_rtt.png
 ```
 
 ## Runner Modes

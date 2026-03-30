@@ -189,122 +189,138 @@ ssh node2 "nslookup github.com"
 
 ## Part 2: OVN-Kubernetes CNI Deployment
 
+> **Two build variants are supported.** Steps that differ between them are marked:
+> - **[BASE]** — standard build, compiled on node0
+> - **[TOPO]** — topology-aware build (`topo-aware` branch), pre-built on your laptop
+
+---
+
 ### Step 1: Install Dependencies (node0)
 
 ```bash
-# Install Go 1.21.7
-cd ~
-curl -LO https://go.dev/dl/go1.21.7.linux-amd64.tar.gz
-sudo tar -C /usr/local -xzf go1.21.7.linux-amd64.tar.gz
-echo 'export PATH=$PATH:/usr/local/go/bin' >> ~/.profile
-export PATH=$PATH:/usr/local/go/bin
-go version
-
-# Install jinjanator (for manifest generation)
-sudo apt install python3-pip
+# Install jinjanator (required for manifest generation — both variants)
+sudo apt install python3-pip -y
 pip3 install --user jinjanator matplotlib
 export PATH="$HOME/.local/bin:$PATH"
 echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.profile
 ```
 
----
-
-### Step 2: Clone and Patch OVN-Kubernetes (node0)
+**[BASE only]** Also install Go for compiling on node0:
 
 ```bash
-# Clone your custom OVN-Kubernetes fork
+curl -LO https://go.dev/dl/go1.21.7.linux-amd64.tar.gz
+sudo tar -C /usr/local -xzf go1.21.7.linux-amd64.tar.gz
+echo 'export PATH=$PATH:/usr/local/go/bin' >> ~/.profile
+export PATH=$PATH:/usr/local/go/bin
+go version
+```
+
+---
+
+### Step 2: Clone OVN-Kubernetes and apply CloudLab patches (node0)
+
+```bash
 cd ~
 git clone https://github.com/Anirudh-R-1201/ovn-kubernetes.git
 cd ovn-kubernetes
-#git checkout <branch>
 
-# CRITICAL: Patch kubectl commands to fix API server discovery issues
-sed -i.bak 's/ apply -f/ apply --validate=false -f/g' dist/images/ovnkube.sh
-sed -i.bak 's/ create -f/ create --validate=false -f/g' dist/images/ovnkube.sh
-sed -i.bak 's/ patch / patch --validate=false /g' dist/images/ovnkube.sh
+# [TOPO] checkout the topo-aware branch
+git checkout topo-aware
 
-# Verify patch was applied
-grep "apply --validate=false" dist/images/ovnkube.sh
+# CRITICAL: patch kubectl calls to fix API server validation on CloudLab
+sed -i 's/ apply -f/ apply --validate=false -f/g' dist/images/ovnkube.sh
+sed -i 's/ create -f/ create --validate=false -f/g' dist/images/ovnkube.sh
+sed -i 's/ patch / patch --validate=false /g' dist/images/ovnkube.sh
+
+grep "apply --validate=false" dist/images/ovnkube.sh  # verify
 ```
 
 ---
 
-### Step 3: Build OVN-Kubernetes Image (node0)
+### Step 3: Build or obtain the OVN-Kubernetes image
+
+**[BASE] Build on node0 (~15 minutes):**
 
 ```bash
 cd ~/ovn-kubernetes/dist/images
-
-# Build Ubuntu-based image (10-15 minutes)
 make ubuntu-image
-
-# Tag for deployment
 docker tag ovn-kube-ubuntu:latest ovn-kube:latest
+docker save ovn-kube:latest -o ~/ovn-kube.tar
+```
 
-# Save for distribution to workers
-cd ~
-docker save ovn-kube:latest -o ovn-kube.tar
+**[TOPO] Build on your laptop (cross-compile for linux/amd64), then transfer:**
 
-# Import into local containerd
-sudo ctr -n k8s.io image import ovn-kube.tar
+```bash
+# On your laptop — in the topo-aware branch
+cd ~/ovn-kubernetes/dist/images
+make ubuntu-image
+docker tag ovn-kube-ubuntu:latest ovn-kube:latest
+docker save ovn-kube:latest -o ~/ovn-kube-topo.tar
+docker save ovn-kube-topo:latest -o ~/ovn-kube-topo.tar
+
+# Copy to node0
+scp ~/ovn-kube-topo.tar anirudh1@<node0-ip>:~/
 ```
 
 ---
 
-### Step 4: Distribute Image to Workers
+### Step 4: Distribute image to all nodes
 
-**From local (your laptop):**
-
-```bash
-# Download from node0
-scp node0:~/ovn-kube.tar .
-
-# Upload to each worker
-scp ovn-kube.tar node1:~/
-scp ovn-kube.tar node2:~/
-```
-
-**On each worker node:**
+**From node0**, push the tar to every node and import into containerd:
 
 ```bash
-sudo ctr -n k8s.io image import ~/ovn-kube.tar
 
-# Verify
+# Do on each node
+sudo ctr -n k8s.io image import ~/ovn-kube-topo.tar 
 sudo ctr -n k8s.io image ls | grep ovn-kube
 ```
 
 ---
 
-### Step 5: Generate OVN Manifests (node0)
+### Step 5: Prepare OVN data directories (All Nodes)
 
 ```bash
-cd ~/ovn-kubernetes/dist/images
+# On node0
+sudo mkdir -p /var/lib/ovn/etc /var/lib/ovn/data
+sudo chmod 755 /var/lib/ovn /var/lib/ovn/etc /var/lib/ovn/data
 
-# Ensure jinjanator is in PATH
-export PATH="$HOME/.local/bin:$PATH"
-
-# Generate manifests
-./daemonset.sh \
-  --image=ovn-kube:latest \
-  --net-cidr=10.128.0.0/14 \
-  --svc-cidr=172.30.0.0/16
-
-# Verify manifests were created
-ls -lh ../yaml/
+# On all workers
+for n in node1 node2 node3 node4 node5; do
+  ssh ${n} "sudo mkdir -p /var/lib/ovn/etc /var/lib/ovn/data && \
+            sudo chmod 755 /var/lib/ovn /var/lib/ovn/etc /var/lib/ovn/data"
+done
 ```
 
 ---
 
-### Step 6: Prepare OVN Directories (All Nodes)
+### Step 6: Generate OVN manifests (node0)
 
-**On node0:**
 ```bash
-sudo mkdir -p /var/lib/ovn/etc /var/lib/ovn/data
-sudo chmod 755 /var/lib/ovn /var/lib/ovn/etc /var/lib/ovn/data
+cd ~/ovn-kubernetes/dist/images
+export PATH="$HOME/.local/bin:$PATH"
 ```
 
-**On each worker (node1, node2, ...):**
+**[BASE]:**
+
 ```bash
-sudo mkdir -p /var/lib/ovn/etc /var/lib/ovn/data && sudo chmod 755 /var/lib/ovn /var/lib/ovn/etc /var/lib/ovn/data
+./daemonset.sh \
+  --image=ovn-kube:latest \
+  --net-cidr=10.128.0.0/14 \
+  --svc-cidr=172.30.0.0/16
+```
+
+**[TOPO]:**
+
+```bash
+OVN_ENABLE_TOPOLOGY_AWARE_LB=true ./daemonset.sh \
+  --image=ovn-kube-topo:latest \
+  --net-cidr=10.128.0.0/14 \
+  --svc-cidr=172.30.0.0/16 \
+  --enable-topology-aware-lb=true
+
+# Verify the flag was baked in
+grep "TOPOLOGY_AWARE" ../yaml/ovnkube-master.yaml
+# Expected: value: "true"
 ```
 
 ---
@@ -314,42 +330,26 @@ sudo mkdir -p /var/lib/ovn/etc /var/lib/ovn/data && sudo chmod 755 /var/lib/ovn 
 ```bash
 cd ~/ovn-kubernetes
 
-# Apply setup (creates namespaces and ConfigMap)
 kubectl apply -f dist/yaml/ovn-setup.yaml
 
-# CRITICAL: Fix API server address in ConfigMap
+# Fix API server address (CRITICAL on CloudLab)
 CORRECT_API_SERVER=$(kubectl config view -o jsonpath='{.clusters[0].cluster.server}')
-kubectl patch configmap ovn-config -n ovn-kubernetes --type merge -p "{\"data\":{\"k8s_apiserver\":\"${CORRECT_API_SERVER}\"}}"
-
-# Verify the fix
+kubectl patch configmap ovn-config -n ovn-kubernetes --type merge \
+  -p "{\"data\":{\"k8s_apiserver\":\"${CORRECT_API_SERVER}\"}}"
 kubectl get configmap -n ovn-kubernetes ovn-config -o jsonpath='{.data.k8s_apiserver}'
-echo ""
 
-# Apply RBAC manifests
 kubectl apply -f dist/yaml/rbac-ovnkube-db.yaml
 kubectl apply -f dist/yaml/rbac-ovnkube-master.yaml
 kubectl apply -f dist/yaml/rbac-ovnkube-node.yaml
-
-# Apply OpenVSwitch daemonset (must be first)
 kubectl apply -f dist/yaml/ovs-node.yaml
-
-# Wait for OVS to be ready
 kubectl wait --for=condition=ready pod -l name=ovs-node -n ovn-kubernetes --timeout=120s
 
-# Apply OVN database
 kubectl apply -f dist/yaml/ovnkube-db.yaml
-
-# Wait for database to initialize (60-90 seconds)
 sleep 60
 kubectl wait --for=condition=ready pod -l name=ovnkube-db -n ovn-kubernetes --timeout=180s
 
-# Apply OVN master (control plane)
 kubectl apply -f dist/yaml/ovnkube-master.yaml
-
-# Apply OVN node (data plane)
 kubectl apply -f dist/yaml/ovnkube-node.yaml
-
-# Wait for pods to start
 sleep 10
 ```
 
@@ -357,26 +357,14 @@ sleep 10
 
 ### Step 8: Approve Certificate Signing Requests (node0)
 
-**CRITICAL:** OVN-Kubernetes pods request certificates for authentication. These must be manually approved the first time.
+**CRITICAL:** OVN pods request certificates that must be manually approved the first time.
 
 ```bash
-# Check for pending CSRs
-kubectl get csr
-
-# Approve all pending CSRs
 kubectl get csr -o name | xargs kubectl certificate approve
-
-# Verify all are approved (should show "Approved,Issued")
-kubectl get csr
+kubectl get csr   # all should show Approved,Issued
 ```
 
-**Expected:** All CSRs should show `CONDITION: Approved,Issued`
-
----
-
-### Step 8b: Enable Automatic CSR Approval (OPTIONAL but Recommended)
-
-To avoid having to manually approve CSRs every time OVN pods restart, set up automatic approval:
+**Recommended: set up automatic approval so you never need to do this again:**
 
 ```bash
 cat <<EOF | kubectl apply -f -
@@ -430,9 +418,8 @@ spec:
           containers:
           - name: approver
             image: bitnami/kubectl:latest
-            command:
-            - /bin/sh
-            - -c
+            command: ["/bin/sh", "-c"]
+            args:
             - |
               kubectl get csr -o json | \
               jq -r '.items[] | select(.status.conditions == null) | .metadata.name' | \
@@ -440,27 +427,11 @@ spec:
 EOF
 ```
 
-**What this does:**
-- Creates a CronJob that runs every minute
-- Automatically approves any pending CSRs
-- Prevents OVN pods from crashing due to certificate expiration
-
-**Verify it's working:**
-```bash
-# Check cronjob exists
-kubectl get cronjob -n kube-system csr-approver
-
-# Check if jobs are running
-kubectl get jobs -n kube-system | grep csr-approver
-```
-
 ---
 
-### Step 9: Restart Services on Worker Nodes
+### Step 9: Restart services on worker nodes (node1, node2...)
 
-**CRITICAL:** Containerd and kubelet must be restarted to detect the CNI configuration.
-
-**On each worker node (node1, node2, ...):**
+**CRITICAL:** Workers need containerd and kubelet restarted to pick up the CNI config.
 
 ```bash
 # Fix CNI config permissions (if needed)
@@ -484,35 +455,83 @@ sudo journalctl -u kubelet -n 20 --no-pager | grep -i cni
 
 ---
 
-### Step 10: Verify Deployment
-
-**Wait 30-60 seconds** after restarting kubelet, then check:
+### Step 10: Verify deployment
 
 ```bash
-# Check pod status
-kubectl get pods -n ovn-kubernetes -o wide
+sleep 30
+kubectl get nodes -o wide          # all should be Ready
+kubectl get pods -n ovn-kubernetes -o wide   # all Running
 
-# Check node status (ALL nodes should now be Ready)
-kubectl get nodes -o wide
 
-# Verify CNI is working
-kubectl get pods -A
 ```
 
-**Expected result:**
+**Expected:**
 ```
-NAME                READY   STATUS    RESTARTS   AGE
-ovnkube-db-xxx      2/2     Running   0          5m
-ovnkube-master-xxx  2/2     Running   0          4m
-ovnkube-node-xxx    3/3     Running   0          3m
-ovs-node-xxx        1/1     Running   0          6m
+NAME              READY   STATUS    RESTARTS
+ovnkube-db        2/2     Running   0
+ovnkube-master    2/2     Running   0
+ovnkube-node      3/3     Running   0  (one per worker)
+ovs-node          1/1     Running   0  (one per node)
 ```
 
-**Nodes should be Ready:**
+---
+
+### Step 11 [TOPO only]: Label nodes with topology zones and annotate services
+
+**Node zone labels** — assign each worker to a zone. On CloudLab all nodes are typically on the same physical rack, so zones are logical groupings. Measure actual RTT with `ping` between nodes to determine real locality before assigning:
+
+```bash
+# Assign zones (adjust grouping based on measured RTT)
+# recheck node names from kubectl get nodes -o wide
+kubectl label node node1.599test.csci599-pg0.utah.cloudlab.us topology.kubernetes.io/zone=zone-a
+kubectl label node node2.599test.csci599-pg0.utah.cloudlab.us topology.kubernetes.io/zone=zone-b
+kubectl label node node3.599test.csci599-pg0.utah.cloudlab.us topology.kubernetes.io/zone=zone-c
+kubectl label node node4.599test.csci599-pg0.utah.cloudlab.us topology.kubernetes.io/zone=zone-d
+kubectl label node node5.599test.csci599-pg0.utah.cloudlab.us topology.kubernetes.io/zone=zone-e
+kubectl get nodes --show-labels | grep topology
 ```
-NAME     STATUS   ROLES           AGE   VERSION
-node0    Ready    control-plane   30m   v1.29.15
-node1    Ready    <none>          29m   v1.29.15
+
+**Service opt-in annotation** — the feature only applies to services with this annotation:
+
+```bash
+# After deploying online-botique using ./stage1-baseline/00-deploy-boutique.sh
+# Fix metrics-server TLS (CloudLab uses self-signed certs)
+kubectl patch deployment metrics-server -n kube-system \
+  --type='json' \
+  -p='[{"op":"add","path":"/spec/template/spec/containers/0/args/-","value":"--kubelet-insecure-tls"}]'
+kubectl top nodes   # should show CPU/memory after ~60s
+
+for svc in frontend productcatalogservice cartservice checkoutservice \
+           currencyservice recommendationservice paymentservice \
+           shippingservice emailservice adservice; do
+  kubectl annotate service $svc service.kubernetes.io/topology-mode=Auto --overwrite
+done
+
+kubectl get services -o custom-columns='NAME:.metadata.name,TOPO:.metadata.annotations.service\.kubernetes\.io/topology-mode'
+```
+
+**Verify topology-aware LBs are created:**
+
+```bash
+DB_POD=$(kubectl get pod -n ovn-kubernetes -l name=ovnkube-db -o jsonpath='{.items[0].metadata.name}')
+kubectl exec -n ovn-kubernetes $DB_POD -- \
+  ovn-nbctl list load_balancer | grep "selection_fields" | sort | uniq -c
+# Topology-aware LBs: selection_fields : ["ip_src", "ip_dst"]
+# Regular LBs:        selection_fields : []
+```
+
+**Toggle the feature on a live cluster without rebuilding:**
+
+```bash
+# Enable
+kubectl set env deployment/ovnkube-master -n ovn-kubernetes \
+  -c ovnkube-master OVN_ENABLE_TOPOLOGY_AWARE_LB=true
+kubectl rollout restart deployment/ovnkube-master -n ovn-kubernetes
+
+# Disable (for baseline comparison run)
+kubectl set env deployment/ovnkube-master -n ovn-kubernetes \
+  -c ovnkube-master OVN_ENABLE_TOPOLOGY_AWARE_LB=false
+kubectl rollout restart deployment/ovnkube-master -n ovn-kubernetes
 ```
 
 ---
@@ -543,11 +562,13 @@ sudo chattr +i /etc/resolv.conf
 # Workers: ./worker.sh "<join command>"
 ```
 
-### 3. Build and Deploy OVN-Kubernetes (Part 2, Steps 1-7)
-- Patch kubectl commands with `--validate=false`
-- Build and distribute image
-- Generate manifests
-- Deploy OVN components
+### 3. Build and Deploy OVN-Kubernetes (Part 2)
+- **[BASE]** Install Go on node0, build with `make ubuntu-image`, distribute tar
+- **[TOPO]** Build `ovn-kube-topo.tar` on your laptop (`GOOS=linux GOARCH=amd64 make`), scp to all nodes
+- Patch kubectl commands with `--validate=false` (both variants)
+- Generate manifests: base uses `./daemonset.sh --image=ovn-kube:latest`, topo uses `OVN_ENABLE_TOPOLOGY_AWARE_LB=true ./daemonset.sh --image=ovn-kube-topo:latest --enable-topology-aware-lb=true`
+- Deploy OVN components (Steps 7–10 identical for both)
+- **[TOPO]** Step 11: label nodes with `topology.kubernetes.io/zone`, annotate services with `topology-mode: Auto`
 
 ### 4. Approve CSRs Manually (First Time)
 ```bash
@@ -597,75 +618,86 @@ kubectl get pods -n ovn-kubernetes  # All 3/3 Running
 
 ## Quick Start (Complete Workflow)
 
-For experienced users, here's the complete workflow:
+Set `VARIANT=base` or `VARIANT=topo` at the top and the script adapts:
 
 ```bash
-# === Part 1: Kubernetes Cluster ===
+# ── CHOOSE VARIANT ──────────────────────────────────────────────
+VARIANT=topo          # "base" or "topo"
+WORKERS="node1 node2 node3 node4 node5"
+# ────────────────────────────────────────────────────────────────
 
-# On all nodes: Fix DNS FIRST
+# === Part 1: Kubernetes Cluster (all nodes) ===
 sudo systemctl stop systemd-resolved && sudo systemctl disable systemd-resolved
 sudo rm -f /etc/resolv.conf
-sudo bash -c 'cat > /etc/resolv.conf << EOF
-nameserver 8.8.8.8
-nameserver 8.8.4.4
-EOF'
+sudo bash -c 'printf "nameserver 8.8.8.8\nnameserver 8.8.4.4\n" > /etc/resolv.conf'
 sudo chattr +i /etc/resolv.conf
 
-# On all nodes: Setup Kubernetes
-cd ~/CSCI599
-./all.sh && newgrp docker
+cd ~/CSCI599 && ./all.sh && newgrp docker
+./node0.sh && cat join.sh   # node0 only; run worker.sh on each worker
 
-# On node0: Initialize control plane
-./node0.sh
-cat join.sh
+# === Part 2: OVN-Kubernetes CNI (node0) ===
 
-# On workers: Join cluster
-./worker.sh "<join command from node0>"
-
-# === Part 2: OVN-Kubernetes CNI ===
-
-# On node0: Install dependencies
-curl -LO https://go.dev/dl/go1.21.7.linux-amd64.tar.gz
-sudo tar -C /usr/local -xzf go1.21.7.linux-amd64.tar.gz
-export PATH=$PATH:/usr/local/go/bin
-pip3 install --user jinjanator
+# Dependencies
+sudo apt install python3-pip -y
+pip3 install --user jinjanator matplotlib
 export PATH="$HOME/.local/bin:$PATH"
 
-# On node0: Clone and patch OVN-Kubernetes
+# [BASE only] install Go for on-node compilation
+if [[ $VARIANT == "base" ]]; then
+  curl -LO https://go.dev/dl/go1.21.7.linux-amd64.tar.gz
+  sudo tar -C /usr/local -xzf go1.21.7.linux-amd64.tar.gz
+  export PATH=$PATH:/usr/local/go/bin
+fi
+
+# Clone and patch
+cd ~
 git clone https://github.com/Anirudh-R-1201/ovn-kubernetes.git
 cd ovn-kubernetes
+[[ $VARIANT == "topo" ]] && git checkout topo-aware
 sed -i 's/ apply -f/ apply --validate=false -f/g' dist/images/ovnkube.sh
 sed -i 's/ create -f/ create --validate=false -f/g' dist/images/ovnkube.sh
 sed -i 's/ patch / patch --validate=false /g' dist/images/ovnkube.sh
 
-# Build and distribute
-cd dist/images && make ubuntu-image
-docker tag ovn-kube-ubuntu:latest ovn-kube:latest
-docker save ovn-kube:latest -o ~/ovn-kube.tar
-sudo ctr -n k8s.io image import ~/ovn-kube.tar
+# Build / obtain image
+if [[ $VARIANT == "base" ]]; then
+  cd dist/images && make ubuntu-image
+  docker tag ovn-kube-ubuntu:latest ovn-kube:latest
+  docker save ovn-kube:latest -o ~/ovn-kube.tar
+  cd ~
+  TAR=ovn-kube.tar; IMAGE=ovn-kube:latest
+else
+  # [TOPO] ovn-kube-topo.tar must already be scp'd to ~/
+  TAR=ovn-kube-topo.tar; IMAGE=ovn-kube-topo:latest
+fi
 
-# From laptop: distribute to workers
-scp node0:~/ovn-kube.tar .
-scp ovn-kube.tar node1:~/
-scp ovn-kube.tar node2:~/
+# Distribute image to all nodes
+for n in $WORKERS; do scp ~/$TAR ${n}:~/; done
+for n in node0 $WORKERS; do ssh ${n} "sudo ctr -n k8s.io image import ~/$TAR" & done
+wait
 
-# On workers: import image
-ssh node1 "sudo ctr -n k8s.io image import ~/ovn-kube.tar"
-ssh node2 "sudo ctr -n k8s.io image import ~/ovn-kube.tar"
-
-# On all nodes: prepare directories
+# Prepare OVN directories
 sudo mkdir -p /var/lib/ovn/etc /var/lib/ovn/data
-ssh node1 "sudo mkdir -p /var/lib/ovn/etc /var/lib/ovn/data"
-ssh node2 "sudo mkdir -p /var/lib/ovn/etc /var/lib/ovn/data"
+for n in $WORKERS; do
+  ssh ${n} "sudo mkdir -p /var/lib/ovn/etc /var/lib/ovn/data"
+done
 
-# On node0: generate and deploy
+# Generate manifests
 cd ~/ovn-kubernetes/dist/images
-./daemonset.sh --image=ovn-kube:latest --net-cidr=10.128.0.0/14 --svc-cidr=172.30.0.0/16
+if [[ $VARIANT == "base" ]]; then
+  ./daemonset.sh --image=$IMAGE --net-cidr=10.128.0.0/14 --svc-cidr=172.30.0.0/16
+else
+  OVN_ENABLE_TOPOLOGY_AWARE_LB=true ./daemonset.sh \
+    --image=$IMAGE --net-cidr=10.128.0.0/14 --svc-cidr=172.30.0.0/16 \
+    --enable-topology-aware-lb=true
+  grep "TOPOLOGY_AWARE" ../yaml/ovnkube-master.yaml  # verify: value: "true"
+fi
 
+# Deploy
 cd ~/ovn-kubernetes
 kubectl apply -f dist/yaml/ovn-setup.yaml
 CORRECT_API_SERVER=$(kubectl config view -o jsonpath='{.clusters[0].cluster.server}')
-kubectl patch configmap ovn-config -n ovn-kubernetes --type merge -p "{\"data\":{\"k8s_apiserver\":\"${CORRECT_API_SERVER}\"}}"
+kubectl patch configmap ovn-config -n ovn-kubernetes --type merge \
+  -p "{\"data\":{\"k8s_apiserver\":\"${CORRECT_API_SERVER}\"}}"
 kubectl apply -f dist/yaml/rbac-ovnkube-db.yaml
 kubectl apply -f dist/yaml/rbac-ovnkube-master.yaml
 kubectl apply -f dist/yaml/rbac-ovnkube-node.yaml
@@ -675,25 +707,34 @@ kubectl apply -f dist/yaml/ovnkube-db.yaml
 sleep 60
 kubectl apply -f dist/yaml/ovnkube-master.yaml
 kubectl apply -f dist/yaml/ovnkube-node.yaml
-
-# Approve CSRs (FIRST TIME - MANUAL)
 sleep 10
 kubectl get csr -o name | xargs kubectl certificate approve
 
-# Setup auto-approval (see Step 8b for full YAML)
-kubectl apply -f csr-approver.yaml
+# Restart workers
+for n in $WORKERS; do
+  ssh ${n} "sudo chmod 644 /etc/cni/net.d/10-ovn-kubernetes.conf 2>/dev/null; \
+            sudo systemctl restart containerd && sleep 10 && \
+            sudo systemctl restart kubelet" &
+done
+wait
+sleep 30
+kubectl get nodes && kubectl get pods -n ovn-kubernetes -o wide
 
-# On workers: restart services
-ssh node1 "sudo chmod 644 /etc/cni/net.d/10-ovn-kubernetes.conf && \
-           sudo systemctl restart containerd && sleep 10 && \
-           sudo systemctl restart kubelet"
-ssh node2 "sudo chmod 644 /etc/cni/net.d/10-ovn-kubernetes.conf && \
-           sudo systemctl restart containerd && sleep 10 && \
-           sudo systemctl restart kubelet"
+# [TOPO only] label nodes and annotate services (after Online Boutique is deployed)
+if [[ $VARIANT == "topo" ]]; then
+  # Adjust zone groupings based on measured ping RTT between nodes
+  ZONE=(zone-a zone-a zone-b zone-b zone-c)
+  i=0; for n in $WORKERS; do
+    kubectl label node ${n}.<exp>.utah.cloudlab.us topology.kubernetes.io/zone=${ZONE[$i]} --overwrite
+    ((i++))
+  done
 
-# Verify
-kubectl get nodes
-kubectl get pods -n ovn-kubernetes -o wide
+  for svc in frontend productcatalogservice cartservice checkoutservice \
+             currencyservice recommendationservice paymentservice \
+             shippingservice emailservice adservice; do
+    kubectl annotate service $svc service.kubernetes.io/topology-mode=Auto --overwrite
+  done
+fi
 ```
 
 ---
