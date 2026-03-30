@@ -16,6 +16,14 @@ spec:
       labels:
         app: s2s-prober
     spec:
+      # Pin to node0 (control plane) — no Online Boutique pods there, so probing
+      # traffic doesn't skew service pod placement or topology-aware routing.
+      nodeSelector:
+        node-role.kubernetes.io/control-plane: ""
+      tolerations:
+        - key: "node-role.kubernetes.io/control-plane"
+          operator: "Exists"
+          effect: "NoSchedule"
       containers:
         - name: curl
           image: curlimages/curl:latest

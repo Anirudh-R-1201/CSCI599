@@ -484,10 +484,10 @@ ovs-node          1/1     Running   0  (one per node)
 # Assign zones (adjust grouping based on measured RTT)
 # recheck node names from kubectl get nodes -o wide
 kubectl label node node1.599test.csci599-pg0.utah.cloudlab.us topology.kubernetes.io/zone=zone-a
-kubectl label node node2.599test.csci599-pg0.utah.cloudlab.us topology.kubernetes.io/zone=zone-b
-kubectl label node node3.599test.csci599-pg0.utah.cloudlab.us topology.kubernetes.io/zone=zone-c
-kubectl label node node4.599test.csci599-pg0.utah.cloudlab.us topology.kubernetes.io/zone=zone-d
-kubectl label node node5.599test.csci599-pg0.utah.cloudlab.us topology.kubernetes.io/zone=zone-e
+kubectl label node node2.599test.csci599-pg0.utah.cloudlab.us topology.kubernetes.io/zone=zone-c
+kubectl label node node3.599test.csci599-pg0.utah.cloudlab.us topology.kubernetes.io/zone=zone-b
+kubectl label node node4.599test.csci599-pg0.utah.cloudlab.us topology.kubernetes.io/zone=zone-b
+kubectl label node node5.599test.csci599-pg0.utah.cloudlab.us topology.kubernetes.io/zone=zone-a
 kubectl get nodes --show-labels | grep topology
 ```
 

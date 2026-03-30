@@ -6,6 +6,14 @@ metadata:
     app: k6-loadgen
 spec:
   restartPolicy: Never
+  # Pin to node0 (control plane) — no Online Boutique pods there, so load
+  # generation doesn't skew service pod placement or topology-aware routing.
+  nodeSelector:
+    node-role.kubernetes.io/control-plane: ""
+  tolerations:
+    - key: "node-role.kubernetes.io/control-plane"
+      operator: "Exists"
+      effect: "NoSchedule"
   containers:
     - name: k6
       image: grafana/k6:latest
