@@ -36,6 +36,22 @@ while true; do sleep 2 && kubectl get csr -o name | xargs kubectl certificate ap
 To produce a directly comparable pair of runs (same cluster, same hardware, only the LB policy differs):
 
 ```bash
+##NOTE: run the following cmd before any experiment to ensure there are no stale resources
+kubectl delete pod --field-selector=status.phase=Failed -n default 
+kubectl delete hpa --all
+# Now scale down to 1 — will actually stick
+kubectl scale deployment frontend productcatalogservice recommendationservice checkoutservice cartservice --replicas=1
+# Wait for pods to terminate
+kubectl wait --for=condition=available deployment/frontend deployment/productcatalogservice deployment/recommendationservice deployment/checkoutservice deployment/cartservice --timeout=60s
+
+```
+```bash
+#If needed run the following on all nodes
+sudo crictl --runtime-endpoint unix:///run/containerd/containerd.sock rmi --prune 2>/dev/null; sudo journalctl --vacuum-size=500M
+
+```
+
+```bash
 # ── Baseline run (topo-aware OFF) ──────────────────────────────
 kubectl set env deployment/ovnkube-master -n ovn-kubernetes \
   -c ovnkube-master OVN_ENABLE_TOPOLOGY_AWARE_LB=false
@@ -50,7 +66,7 @@ sleep 30
 # Recreate k6 pod fresh
 kubectl delete pod k6-loadgen --ignore-not-found
 kubectl apply -f k6-loadgen.yaml
-kubectl get pod k6-loadgen -w   # wait for Running
+kubectl get pod k6-loadgen   # wait for Running
 
 MODE=full ./01-run-experiment.sh && ./02-analyze-results.sh
 # Note the RUN_ID printed — this is your baseline
@@ -61,6 +77,7 @@ kubectl set env deployment/ovnkube-master -n ovn-kubernetes \
   -c ovnkube-master OVN_ENABLE_TOPOLOGY_AWARE_LB=true
 kubectl rollout restart deployment/ovnkube-master -n ovn-kubernetes
 kubectl rollout status deployment/ovnkube-master -n ovn-kubernetes --timeout=120s
+
 
 # Verify topology-aware LBs are active
 DB_POD=$(kubectl get pod -n ovn-kubernetes -l name=ovnkube-db -o jsonpath='{.items[0].metadata.name}')

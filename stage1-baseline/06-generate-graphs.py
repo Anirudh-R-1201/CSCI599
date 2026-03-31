@@ -654,14 +654,12 @@ def plot_pod_distribution(snapshots, output_dir):
 # ---------------------------------------------------------------------------
 
 def plot_service_placement(placement, output_dir):
-    """Heatmap: service × node pod counts (average over all snapshots)."""
-    spread = (placement.get("service_node_spread_avg") or
-              placement.get("service_node_spread")) if placement else None
+    """Heatmap: service × node average pod counts over all snapshots."""
+    spread = placement.get("service_node_spread_avg") if placement else None
     if not spread:
-        print("⚠ No service_node_spread, skipping graph 05")
+        print("⚠ No service_node_spread_avg, skipping graph 05")
         return
 
-    use_avg = bool(placement.get("service_node_spread_avg"))
     services = sorted(spread.keys())
     all_nodes = set()
     for info in spread.values():
@@ -671,8 +669,7 @@ def plot_service_placement(placement, output_dir):
 
     data = []
     for svc in services:
-        counts = (spread[svc].get("pod_count_by_node") or
-                  spread[svc].get("samples_per_node", {}))
+        counts = spread[svc].get("pod_count_by_node", {})
         data.append([counts.get(n, 0) for n in nodes])
 
     if not data or not nodes:
@@ -689,16 +686,15 @@ def plot_service_placement(placement, output_dir):
     ax.set_yticklabels(services, fontsize=9)
     ax.set_xlabel("Node", fontsize=11)
     ax.set_ylabel("Service", fontsize=11)
-    ax.set_title("5. Placement: which service's pods are on which node (average over all snapshots)",
+    ax.set_title("5. Service Pod Placement — average replicas per node across all snapshots",
                  fontsize=12, fontweight="bold")
-    plt.colorbar(im, ax=ax, label="Pod count (average over all snapshots)", fraction=0.03, pad=0.02)
+    plt.colorbar(im, ax=ax, label="Avg. pod count per snapshot", fraction=0.03, pad=0.02)
 
     for i in range(len(services)):
         for j in range(len(nodes)):
             v = data[i][j]
             if v > 0:
-                label = (f"{v:.1f}" if use_avg and isinstance(v, float) and v != int(v)
-                         else str(int(round(v))))
+                label = f"{v:.1f}" if isinstance(v, float) and v != int(v) else str(int(round(v)))
                 ax.text(j, i, label, ha="center", va="center",
                         color="white" if v >= vmax / 2 else "black", fontsize=9)
 
