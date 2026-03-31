@@ -23,9 +23,9 @@ BURSTS="${BURSTS:-18}"
 BASE_BURST_SECONDS="${BASE_BURST_SECONDS:-90}"
 MAX_BURST_SECONDS="${MAX_BURST_SECONDS:-180}"
 MAX_SLEEP_SECONDS="${MAX_SLEEP_SECONDS:-5}"
-QPS_FLOOR="${QPS_FLOOR:-150}"
-QPS_CEIL="${QPS_CEIL:-1500}"
-THREADS_PER_ENDPOINT="${THREADS_PER_ENDPOINT:-12}"
+QPS_FLOOR="${QPS_FLOOR:-100}"
+QPS_CEIL="${QPS_CEIL:-750}"
+THREADS_PER_ENDPOINT="${THREADS_PER_ENDPOINT:-10}"
 SAMPLE_INTERVAL="${SAMPLE_INTERVAL:-8}"
 
 echo "========================================"
@@ -40,6 +40,41 @@ ensure_cluster() {
     echo "Error: cannot connect to Kubernetes cluster via ${KUBECONFIG_PATH}"
     exit 1
   fi
+
+  # Block if any nodes are NotReady
+  NOT_READY=$(kubectl --kubeconfig "${KUBECONFIG_PATH}" get nodes --no-headers | grep -v " Ready" | wc -l)
+  if [ "${NOT_READY}" -gt 0 ]; then
+    echo "Error: ${NOT_READY} node(s) are not Ready. Fix before running experiment:"
+    kubectl --kubeconfig "${KUBECONFIG_PATH}" get nodes
+    exit 1
+  fi
+
+  # Block if ovnkube-node pods are not all healthy
+  UNHEALTHY_OVN=$(kubectl --kubeconfig "${KUBECONFIG_PATH}" -n ovn-kubernetes get pods -l app=ovnkube-node --no-headers 2>/dev/null \
+    | grep -v "Running" | wc -l)
+  if [ "${UNHEALTHY_OVN}" -gt 0 ]; then
+    echo "Error: ${UNHEALTHY_OVN} ovnkube-node pod(s) not Running. Approve pending CSRs first:"
+    echo "  kubectl get csr | grep Pending | awk '{print \$1}' | xargs kubectl certificate approve"
+    exit 1
+  fi
+
+  # Warn if any node disk is >85% full (causes pod evictions / ContainerStatusUnknown)
+  for node in $(kubectl --kubeconfig "${KUBECONFIG_PATH}" get nodes --no-headers | awk '{print $1}'); do
+    shortname=$(echo "${node}" | cut -d. -f1)
+    usage=$(ssh -o StrictHostKeyChecking=no -o ConnectTimeout=3 "${shortname}" \
+      "df / --output=pcent | tail -1 | tr -d ' %'" 2>/dev/null || echo "0")
+    if [ "${usage:-0}" -gt 85 ]; then
+      echo "Warning: ${node} disk is ${usage}% full. Clean with:"
+      echo "  ssh ${shortname} 'sudo crictl --runtime-endpoint unix:///run/containerd/containerd.sock rmi --prune; sudo journalctl --vacuum-size=500M'"
+    fi
+  done
+
+  # Clean up stale Failed/Error pods to keep placement data clean
+  kubectl --kubeconfig "${KUBECONFIG_PATH}" delete pod \
+    --field-selector=status.phase=Failed -n default 2>/dev/null || true
+  kubectl --kubeconfig "${KUBECONFIG_PATH}" get pods -n default --no-headers \
+    | awk '/Error|Unknown/{print $1}' \
+    | xargs -r kubectl --kubeconfig "${KUBECONFIG_PATH}" delete pod -n default 2>/dev/null || true
 }
 
 # Approve pending certificate signing requests (e.g. for OVN-Kubernetes / new nodes)

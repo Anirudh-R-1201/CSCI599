@@ -47,7 +47,10 @@ kubectl wait --for=condition=available deployment/frontend deployment/productcat
 ```
 ```bash
 #If needed run the following on all nodes
-sudo crictl --runtime-endpoint unix:///run/containerd/containerd.sock rmi --prune 2>/dev/null; sudo journalctl --vacuum-size=500M
+sudo crictl --runtime-endpoint unix:///run/containerd/containerd.sock rmi --prune 2>/dev/null; sudo journalctl --vacuum-size=500M; df -h /
+sudo journalctl --vacuum-size=500M
+sudo rm -rf /tmp/*
+df -h /
 
 ```
 
