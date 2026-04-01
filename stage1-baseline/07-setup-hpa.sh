@@ -6,8 +6,8 @@ set -euo pipefail
 
 KUBECONFIG_PATH="${KUBECONFIG_PATH:-$HOME/.kube/config}"
 CPU_THRESHOLD="${CPU_THRESHOLD:-75}"  # Use 50 for more aggressive scaling (more replicas at same load)
-MIN_REPLICAS="${MIN_REPLICAS:-1}"     # Minimum replicas per service
-MAX_REPLICAS="${MAX_REPLICAS:-4}"     # Maximum replicas per service
+MIN_REPLICAS="${MIN_REPLICAS:-3}"     # Minimum replicas per service
+MAX_REPLICAS="${MAX_REPLICAS:-3}"     # Maximum replicas per service
 FRONTEND_EXTRA_CPU="${FRONTEND_EXTRA_CPU:-0}" # Frontend target = CPU_THRESHOLD + this (0 = same as others)
 
 echo "Setting up HorizontalPodAutoscalers..."
@@ -36,10 +36,10 @@ echo "Creating new HPAs..."
 
 # Frontend handles most load, so give it more replicas
 FRONTEND_CPU_TARGET=$((CPU_THRESHOLD + FRONTEND_EXTRA_CPU))
-echo "  frontend: min=${MIN_REPLICAS}, max=$((MAX_REPLICAS + 2)), cpu=${FRONTEND_CPU_TARGET}%"
+echo "  frontend: min=${MIN_REPLICAS + 2}, max=$((MAX_REPLICAS + 2)), cpu=${FRONTEND_CPU_TARGET}%"
 kubectl --kubeconfig "${KUBECONFIG_PATH}" autoscale deployment frontend \
   --cpu-percent="${FRONTEND_CPU_TARGET}" \
-  --min="${MIN_REPLICAS}" \
+  --min="$((MIN_REPLICAS + 2))" \
   --max="$((MAX_REPLICAS + 2))"
 
 # Backend services with standard limits

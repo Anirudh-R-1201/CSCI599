@@ -46,12 +46,13 @@ kubectl wait --for=condition=available deployment/frontend deployment/productcat
 
 ```
 ```bash
-#If needed run the following on all nodes
+#If needed run the following on all nodes to free up disk space
 sudo crictl --runtime-endpoint unix:///run/containerd/containerd.sock rmi --prune 2>/dev/null; sudo journalctl --vacuum-size=500M; df -h /
 sudo journalctl --vacuum-size=500M
 sudo rm -rf /tmp/*
 df -h /
-
+##ONLY do it if one node is not getting equal share during run, check using
+watch -n 5 'kubectl get pods -o wide --field-selector=status.phase=Running | grep -v "Completed\|Terminating" | awk "{print \$7}" | sort | uniq -c | sort -rn'
 ```
 
 ```bash
