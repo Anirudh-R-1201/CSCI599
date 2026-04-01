@@ -6,14 +6,33 @@ set -euo pipefail
 
 KUBECONFIG_PATH="${KUBECONFIG_PATH:-$HOME/.kube/config}"
 CPU_THRESHOLD="${CPU_THRESHOLD:-75}"  # Use 50 for more aggressive scaling (more replicas at same load)
-MIN_REPLICAS="${MIN_REPLICAS:-3}"     # Minimum replicas per service
-MAX_REPLICAS="${MAX_REPLICAS:-3}"     # Maximum replicas per service
 FRONTEND_EXTRA_CPU="${FRONTEND_EXTRA_CPU:-0}" # Frontend target = CPU_THRESHOLD + this (0 = same as others)
 
+# REPLICA_MODE controls scaling behaviour:
+#   fixed  → min=max=4  (no autoscaling; eliminates cold-start noise, best for apples-to-apples comparison)
+#   scale  → min=1, max=4 (normal HPA autoscaling)
+REPLICA_MODE="${REPLICA_MODE:-fixed}"
+
+case "${REPLICA_MODE}" in
+  fixed)
+    MIN_REPLICAS="${MIN_REPLICAS:-4}"
+    MAX_REPLICAS="${MAX_REPLICAS:-4}"
+    ;;
+  scale)
+    MIN_REPLICAS="${MIN_REPLICAS:-1}"
+    MAX_REPLICAS="${MAX_REPLICAS:-4}"
+    ;;
+  *)
+    echo "Error: REPLICA_MODE must be 'fixed' or 'scale' (got '${REPLICA_MODE}')"
+    exit 1
+    ;;
+esac
+
 echo "Setting up HorizontalPodAutoscalers..."
+echo "  REPLICA_MODE: ${REPLICA_MODE}"
 echo "  CPU Threshold: ${CPU_THRESHOLD}%"
-echo "  Min Replicas: ${MIN_REPLICAS}"
-echo "  Max Replicas: ${MAX_REPLICAS}"
+echo "  Min Replicas: ${MIN_REPLICAS} (backend)  $((MIN_REPLICAS + 2)) (frontend)"
+echo "  Max Replicas: ${MAX_REPLICAS} (backend)  $((MAX_REPLICAS + 2)) (frontend)"
 echo ""
 
 # Services to autoscale (frontend needs higher max due to higher load)
@@ -36,7 +55,7 @@ echo "Creating new HPAs..."
 
 # Frontend handles most load, so give it more replicas
 FRONTEND_CPU_TARGET=$((CPU_THRESHOLD + FRONTEND_EXTRA_CPU))
-echo "  frontend: min=${MIN_REPLICAS + 2}, max=$((MAX_REPLICAS + 2)), cpu=${FRONTEND_CPU_TARGET}%"
+echo "  frontend: min=$((MIN_REPLICAS + 2)), max=$((MAX_REPLICAS + 2)), cpu=${FRONTEND_CPU_TARGET}%"
 kubectl --kubeconfig "${KUBECONFIG_PATH}" autoscale deployment frontend \
   --cpu-percent="${FRONTEND_CPU_TARGET}" \
   --min="$((MIN_REPLICAS + 2))" \

@@ -27,11 +27,16 @@ QPS_FLOOR="${QPS_FLOOR:-100}"
 QPS_CEIL="${QPS_CEIL:-750}"
 THREADS_PER_ENDPOINT="${THREADS_PER_ENDPOINT:-10}"
 SAMPLE_INTERVAL="${SAMPLE_INTERVAL:-8}"
+# Fixed seed so BASE and TOPO runs get identical burst plans.
+# Change only when you want a different (but still reproducible) load profile.
+BURST_SEED="${BURST_SEED:-42}"
+# Replica mode: fixed (min=max=4, no cold-start noise) or scale (min=1, max=4, HPA autoscales).
+REPLICA_MODE="${REPLICA_MODE:-fixed}"
 
 echo "========================================"
 echo "Stage1 Experiment Runner"
 echo "========================================"
-echo "MODE=${MODE}"
+echo "MODE=${MODE}  REPLICA_MODE=${REPLICA_MODE}  BURST_SEED=${BURST_SEED}"
 echo "RUN_ID=${RUN_ID}"
 echo ""
 
@@ -110,7 +115,9 @@ deploy_workload_if_needed() {
 }
 
 setup_hpa() {
-  CPU_THRESHOLD="${CPU_THRESHOLD}" "${ROOT_DIR}/07-setup-hpa.sh"
+  CPU_THRESHOLD="${CPU_THRESHOLD}" \
+  REPLICA_MODE="${REPLICA_MODE}" \
+    "${ROOT_DIR}/07-setup-hpa.sh"
 }
 
 # Deploy s2s-prober so service-to-service probes run from a client-like pod (not the load generator).
@@ -128,6 +135,7 @@ run_traffic() {
   QPS_CEIL="${QPS_CEIL}" \
   THREADS_PER_ENDPOINT="${THREADS_PER_ENDPOINT}" \
   SAMPLE_INTERVAL="${SAMPLE_INTERVAL}" \
+  BURST_SEED="${BURST_SEED}" \
     "${ROOT_DIR}/03e-bursty-highload-network-test.sh"
 }
 

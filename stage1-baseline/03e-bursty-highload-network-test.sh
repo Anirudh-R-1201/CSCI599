@@ -27,6 +27,9 @@ MAX_SLEEP_SECONDS="${MAX_SLEEP_SECONDS:-120}"
 QPS_FLOOR="${QPS_FLOOR:-80}"
 QPS_CEIL="${QPS_CEIL:-300}"
 SPIKE_PROBABILITY="${SPIKE_PROBABILITY:-0.35}"
+# Fixed seed guarantees identical burst plans across BASE and TOPO runs.
+# Override with BURST_SEED=<n> to generate a different (but still reproducible) plan.
+BURST_SEED="${BURST_SEED:-42}"
 
 # Endpoint weights (must sum to 1.0).
 # Checkout is a stateful 2-step flow (add-to-cart → submit); k6 VUs maintain
@@ -38,7 +41,7 @@ W_CART="${W_CART:-0.20}"
 W_CHECKOUT="${W_CHECKOUT:-0.15}"
 
 export BURSTS BASE_BURST_SECONDS MAX_BURST_SECONDS MIN_SLEEP_SECONDS MAX_SLEEP_SECONDS
-export QPS_FLOOR QPS_CEIL SPIKE_PROBABILITY
+export QPS_FLOOR QPS_CEIL SPIKE_PROBABILITY BURST_SEED
 export W_HOME W_PRODUCT W_CART W_CHECKOUT
 
 # ── Monitoring settings ───────────────────────────────────────────────────────
@@ -281,7 +284,7 @@ MONITOR_PID=$!
 # ── Burst plan ────────────────────────────────────────────────────────────────
 echo "Generating burst plan..."
 python3 - <<'PY' > "${META_FILE}"
-import json, os, random, time
+import json, os, random
 
 bursts      = int(os.environ["BURSTS"])
 min_dur     = int(os.environ["BASE_BURST_SECONDS"])
@@ -299,7 +302,7 @@ w_product   = float(os.environ["W_PRODUCT"])
 w_cart      = float(os.environ["W_CART"])
 w_checkout  = float(os.environ["W_CHECKOUT"])
 
-random.seed(int(time.time()))
+random.seed(int(os.environ.get("BURST_SEED", "42")))
 for i in range(bursts):
     if random.random() < spike_prob:
         total_qps  = random.randint(int(0.8 * qps_ceil), qps_ceil)

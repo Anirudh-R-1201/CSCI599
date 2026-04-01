@@ -33,92 +33,97 @@ while true; do sleep 2 && kubectl get csr -o name | xargs kubectl certificate ap
 
 ## Baseline vs Topo-Aware Comparison Runs
 
-To produce a directly comparable pair of runs (same cluster, same hardware, only the LB policy differs):
+`REPLICA_MODE=fixed` (default) pins replicas at min=max=4, eliminating HPA cold-start noise so
+the only difference between BASE and TOPO runs is the LB routing policy. `BURST_SEED=42`
+(default) guarantees both runs see the exact same burst plan.
+
+### Pre-flight cleanup (run once before any experiment)
 
 ```bash
-##NOTE: run the following cmd before any experiment to ensure there are no stale resources
-kubectl delete pod --field-selector=status.phase=Failed -n default 
+# Remove stale pods and HPAs
+kubectl delete pod --field-selector=status.phase=Failed -n default
 kubectl delete hpa --all
-# Now scale down to 1 — will actually stick
-kubectl scale deployment frontend productcatalogservice recommendationservice checkoutservice cartservice --replicas=1
-# Wait for pods to terminate
-kubectl wait --for=condition=available deployment/frontend deployment/productcatalogservice deployment/recommendationservice deployment/checkoutservice deployment/cartservice --timeout=60s
 
-```
-```bash
-#If needed run the following on all nodes to free up disk space
-sudo crictl --runtime-endpoint unix:///run/containerd/containerd.sock rmi --prune 2>/dev/null; sudo journalctl --vacuum-size=500M; df -h /
-sudo journalctl --vacuum-size=500M
-sudo rm -rf /tmp/*
-df -h /
-##ONLY do it if one node is not getting equal share during run, check using
-watch -n 5 'kubectl get pods -o wide --field-selector=status.phase=Running | grep -v "Completed\|Terminating" | awk "{print \$7}" | sort | uniq -c | sort -rn'
+# Scale everything to 1 so the experiment's HPA setup starts from a clean slate
+kubectl scale deployment frontend productcatalogservice recommendationservice \
+  checkoutservice cartservice --replicas=1
+kubectl wait --for=condition=available \
+  deployment/frontend deployment/productcatalogservice \
+  deployment/recommendationservice deployment/checkoutservice deployment/cartservice \
+  --timeout=60s
 ```
 
 ```bash
-# ── Baseline run (topo-aware OFF) ──────────────────────────────
+# Free disk space on all worker nodes (run if a node is >85% full)
+for node in node1 node2 node3 node4 node5; do
+  ssh "$node" 'sudo crictl --runtime-endpoint unix:///run/containerd/containerd.sock rmi --prune 2>/dev/null
+               sudo journalctl --vacuum-size=500M
+               sudo rm -rf /tmp/*
+               df -h /'
+done
+
+# Monitor pod distribution during a run
+watch -n 5 'kubectl get pods -o wide --field-selector=status.phase=Running \
+  | grep -v "Completed\|Terminating" | awk "{print \$7}" | sort | uniq -c | sort -rn'
+```
+
+### Baseline run (topo-aware OFF)
+
+```bash
 kubectl set env deployment/ovnkube-master -n ovn-kubernetes \
   -c ovnkube-master OVN_ENABLE_TOPOLOGY_AWARE_LB=false
 kubectl rollout restart deployment/ovnkube-master -n ovn-kubernetes
 kubectl rollout status deployment/ovnkube-master -n ovn-kubernetes --timeout=120s
 
-# Reset replicas for a clean ramp-up
-kubectl scale deployment frontend productcatalogservice recommendationservice \
-  checkoutservice cartservice --replicas=1
-sleep 30
-
 # Recreate k6 pod fresh
 kubectl delete pod k6-loadgen --ignore-not-found
 kubectl apply -f k6-loadgen.yaml
-kubectl get pod k6-loadgen   # wait for Running
+kubectl wait --for=condition=Ready pod/k6-loadgen --timeout=60s
 
-MODE=full ./01-run-experiment.sh && ./02-analyze-results.sh
+# Run — fixed replicas, seed=42 burst plan
+REPLICA_MODE=fixed MODE=full ./01-run-experiment.sh && ./02-analyze-results.sh
 # Note the RUN_ID printed — this is your baseline
+```
 
+### Topo-aware run (topo-aware ON)
 
-# ── Topo-aware run (topo-aware ON) ─────────────────────────────
+```bash
 kubectl set env deployment/ovnkube-master -n ovn-kubernetes \
   -c ovnkube-master OVN_ENABLE_TOPOLOGY_AWARE_LB=true
 kubectl rollout restart deployment/ovnkube-master -n ovn-kubernetes
 kubectl rollout status deployment/ovnkube-master -n ovn-kubernetes --timeout=120s
 
-
 # Verify topology-aware LBs are active
 DB_POD=$(kubectl get pod -n ovn-kubernetes -l name=ovnkube-db -o jsonpath='{.items[0].metadata.name}')
-kubectl exec -n ovn-kubernetes $DB_POD -- \
+kubectl exec -n ovn-kubernetes "$DB_POD" -- \
   ovn-nbctl list load_balancer | grep "selection_fields" | sort | uniq -c
-# Expected: some show [ip_dst, ip_src]  ← topology-aware
-#           others show []              ← regular (kube-system services)
-
-# Reset replicas again for fair comparison
-kubectl scale deployment frontend productcatalogservice recommendationservice \
-  checkoutservice cartservice --replicas=1
-sleep 30
+# Expected: some entries show [ip_dst, ip_src]  ← topology-aware
+#           others show []                       ← regular (kube-system services)
 
 kubectl delete pod k6-loadgen --ignore-not-found
 kubectl apply -f k6-loadgen.yaml
-sleep 5
-kubectl get pod k6-loadgen 
+kubectl wait --for=condition=Ready pod/k6-loadgen --timeout=60s
 
-MODE=full ./01-run-experiment.sh && ./02-analyze-results.sh
+# Run — same REPLICA_MODE and BURST_SEED as baseline for apples-to-apples comparison
+REPLICA_MODE=fixed MODE=full ./01-run-experiment.sh && ./02-analyze-results.sh
 # Note the RUN_ID printed — this is your topo-aware run
 ```
 
-**What to compare across the two runs** (replace `<BASE>` and `<TOPO>` with actual RUN_IDs):
+### What to compare (replace `<BASE>` and `<TOPO>` with actual RUN_IDs)
 
 ```bash
 # Graph 07/08 — cross-node traffic fraction (key metric)
-# Lower bars in topo run = routing is preferring same-zone backends
+# Lower bars in TOPO = routing preferring same-zone backends
 open data/<BASE>/graphs/07_cross_node_ratio.png
 open data/<TOPO>/graphs/07_cross_node_ratio.png
 
-# Graph 03 — latency vs QPS (lower p95/p99 in topo run = less east-west RTT)
-open data/<BASE>/graphs/03_latency_vs_qps.png
-open data/<TOPO>/graphs/03_latency_vs_qps.png
-
-# Graph 11 — queueing vs RTT (topo run should shift cluster to left = shorter RTTs)
+# Graph 11 — queueing vs RTT (TOPO should shift left = shorter RTTs, less queueing)
 open data/<BASE>/graphs/11_queueing_vs_rtt.png
 open data/<TOPO>/graphs/11_queueing_vs_rtt.png
+
+# Graph 03 — latency vs QPS (lower p95/p99 in TOPO = less east-west overhead)
+open data/<BASE>/graphs/03_latency_vs_qps.png
+open data/<TOPO>/graphs/03_latency_vs_qps.png
 ```
 
 ## Runner Modes
@@ -128,30 +133,47 @@ open data/<TOPO>/graphs/11_queueing_vs_rtt.png
 - `prep` – deploy + HPA only
 - `traffic` – traffic + telemetry only (cluster already deployed)
 
-Key variables:
+### Replica modes (`REPLICA_MODE`)
+
+| Mode | Backend min/max | Frontend min/max | Use when |
+|---|---|---|---|
+| `fixed` (default) | 4 / 4 | 6 / 6 | BASE vs TOPO comparison — eliminates HPA cold-start noise |
+| `scale` | 1 / 4 | 3 / 6 | HPA autoscaling experiments — measures scaling behaviour under load |
+
+```bash
+# Fixed replicas — recommended for BASE vs TOPO comparison
+REPLICA_MODE=fixed MODE=full ./01-run-experiment.sh
+
+# HPA autoscaling — replicas ramp from 1 up to 4
+REPLICA_MODE=scale MODE=full ./01-run-experiment.sh
+```
+
+### All key variables
 
 | Variable | Default | Effect |
 |---|---|---|
-| `CPU_THRESHOLD` | `75` | HPA CPU target %; lower = more aggressive scaling |
+| `REPLICA_MODE` | `fixed` | `fixed` = pin replicas (no scaling); `scale` = HPA autoscales |
+| `BURST_SEED` | `42` | Random seed for burst plan — same seed = identical plan across runs |
+| `CPU_THRESHOLD` | `75` | HPA CPU target %; lower = more aggressive scaling (only relevant for `scale` mode) |
 | `BURSTS` | `18` | Number of load bursts |
-| `BASE_BURST_SECONDS` | `45` | Min burst duration |
-| `MAX_BURST_SECONDS` | `90` | Max burst duration |
-| `MIN_SLEEP_SECONDS` | `45` | Min gap between bursts (HPA scale-down time) |
-| `MAX_SLEEP_SECONDS` | `120` | Max gap between bursts |
-| `QPS_FLOOR` | `80` | Minimum burst QPS |
-| `QPS_CEIL` | `300` | Maximum burst QPS |
+| `BASE_BURST_SECONDS` | `90` | Min burst duration (seconds) |
+| `MAX_BURST_SECONDS` | `180` | Max burst duration (seconds) |
+| `MAX_SLEEP_SECONDS` | `5` | Max gap between bursts |
+| `QPS_FLOOR` | `100` | Minimum burst QPS |
+| `QPS_CEIL` | `750` | Maximum burst QPS (spike bursts approach this value) |
+| `SPIKE_PROBABILITY` | `0.35` | Fraction of bursts that are high-QPS spikes |
 | `SAMPLE_INTERVAL` | `8` | Telemetry snapshot interval (seconds) |
 | `W_HOME/PRODUCT/CART/CHECKOUT` | `0.30/0.35/0.20/0.15` | Endpoint weight split |
 
 ```bash
-# Default run
-MODE=full ./01-run-experiment.sh
+# Reproduce a previous run exactly
+BURST_SEED=42 REPLICA_MODE=fixed MODE=full ./01-run-experiment.sh
 
-# More bursts, higher load
-BURSTS=24 QPS_CEIL=400 MODE=full ./01-run-experiment.sh
+# Try a different (but still reproducible) load profile
+BURST_SEED=99 REPLICA_MODE=fixed MODE=full ./01-run-experiment.sh
 
-# If HPA doesn't scale up
-CPU_THRESHOLD=50 MODE=full ./01-run-experiment.sh
+# Autoscaling experiment with heavier load
+REPLICA_MODE=scale QPS_CEIL=1000 MODE=full ./01-run-experiment.sh
 ```
 
 ## Load Generation (k6)
