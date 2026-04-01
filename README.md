@@ -49,6 +49,11 @@ chmod +x all.sh
 newgrp docker
 # OR log out and log back in
 ```
+**Merged cmd**
+
+```bash
+git clone https://github.com/Anirudh-R-1201/CSCI599.git && cd CSCI599 && chmod +x *.sh && ./all.sh && newgrp docker
+```
 
 ---
 
@@ -248,19 +253,6 @@ docker tag ovn-kube-ubuntu:latest ovn-kube:latest
 docker save ovn-kube:latest -o ~/ovn-kube.tar
 ```
 
-**[TOPO] Build on your laptop (cross-compile for linux/amd64), then transfer:**
-
-```bash
-# On your laptop — in the topo-aware branch
-cd ~/ovn-kubernetes/dist/images
-make ubuntu-image
-docker tag ovn-kube-ubuntu:latest ovn-kube:latest
-docker save ovn-kube:latest -o ~/ovn-kube-topo.tar
-docker save ovn-kube-topo:latest -o ~/ovn-kube-topo.tar
-
-# Copy to node0
-scp ~/ovn-kube-topo.tar anirudh1@<node0-ip>:~/
-```
 
 ---
 
@@ -271,7 +263,7 @@ scp ~/ovn-kube-topo.tar anirudh1@<node0-ip>:~/
 ```bash
 
 # Do on each node
-sudo ctr -n k8s.io image import ~/ovn-kube-topo.tar 
+sudo ctr -n k8s.io image import ~/ovn-kube.tar 
 sudo ctr -n k8s.io image ls | grep ovn-kube
 ```
 
@@ -280,15 +272,10 @@ sudo ctr -n k8s.io image ls | grep ovn-kube
 ### Step 5: Prepare OVN data directories (All Nodes)
 
 ```bash
-# On node0
 sudo mkdir -p /var/lib/ovn/etc /var/lib/ovn/data
 sudo chmod 755 /var/lib/ovn /var/lib/ovn/etc /var/lib/ovn/data
 
-# On all workers
-for n in node1 node2 node3 node4 node5; do
-  ssh ${n} "sudo mkdir -p /var/lib/ovn/etc /var/lib/ovn/data && \
-            sudo chmod 755 /var/lib/ovn /var/lib/ovn/etc /var/lib/ovn/data"
-done
+
 ```
 
 ---
@@ -484,10 +471,10 @@ ovs-node          1/1     Running   0  (one per node)
 # Assign zones (adjust grouping based on measured RTT)
 # recheck node names from kubectl get nodes -o wide
 kubectl label node node1.599test.csci599-pg0.utah.cloudlab.us topology.kubernetes.io/zone=zone-a
-kubectl label node node2.599test.csci599-pg0.utah.cloudlab.us topology.kubernetes.io/zone=zone-c
+kubectl label node node2.599test.csci599-pg0.utah.cloudlab.us topology.kubernetes.io/zone=zone-b
 kubectl label node node3.599test.csci599-pg0.utah.cloudlab.us topology.kubernetes.io/zone=zone-b
-kubectl label node node4.599test.csci599-pg0.utah.cloudlab.us topology.kubernetes.io/zone=zone-d #b
-kubectl label node node5.599test.csci599-pg0.utah.cloudlab.us topology.kubernetes.io/zone=zone-e #a
+kubectl label node node4.599test.csci599-pg0.utah.cloudlab.us topology.kubernetes.io/zone=zone-a #b
+kubectl label node node5.599test.csci599-pg0.utah.cloudlab.us topology.kubernetes.io/zone=zone-c #a
 kubectl get nodes --show-labels | grep topology
 ```
 
