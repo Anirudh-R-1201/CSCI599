@@ -114,7 +114,7 @@ export function browseHome() {
 }
 
 export function browseProduct() {
-  const id = PRODUCTS[(__VU + Math.floor(Math.random() * PRODUCTS.length)) % PRODUCTS.length];
+  const id = PRODUCTS[(__VU * 7 + __ITER) % PRODUCTS.length];
   const r = http.get(`${BASE}/product/${id}`, { tags: { name: 'product' } });
   check(r, { 'product 2xx': (res) => res.status >= 200 && res.status < 400 });
 }

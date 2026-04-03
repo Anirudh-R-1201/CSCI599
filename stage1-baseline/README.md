@@ -25,7 +25,7 @@ cd ~/CSCI599/stage1-baseline
 ./00-deploy-boutique.sh
 
 # Step 2: Run experiment
-MODE=full ./01-run-experiment.sh && ./02-analyze-results.sh
+REPLICA_MODE=fixed MIN_REPLICAS=4 MODE=full ./01-run-experiment.sh && ./02-analyze-results.sh
 
 # Approve CSRs in background (required on CloudLab)
 while true; do sleep 2 && kubectl get csr -o name | xargs kubectl certificate approve 2>/dev/null; done
@@ -133,26 +133,41 @@ open data/<TOPO>/graphs/03_latency_vs_qps.png
 - `prep` – deploy + HPA only
 - `traffic` – traffic + telemetry only (cluster already deployed)
 
-### Replica modes (`REPLICA_MODE`)
+### Replica modes (`REPLICA_MODE` + `MIN_REPLICAS`)
 
-| Mode | Backend min/max | Frontend min/max | Use when |
-|---|---|---|---|
-| `fixed` (default) | 4 / 4 | 6 / 6 | BASE vs TOPO comparison — eliminates HPA cold-start noise |
-| `scale` | 1 / 4 | 3 / 6 | HPA autoscaling experiments — measures scaling behaviour under load |
+`REPLICA_MODE` controls whether replicas are pinned or autoscaled.
+`MIN_REPLICAS` sets the count (in `fixed` mode) or floor (in `scale` mode). Frontend always gets `MIN_REPLICAS + 2`.
+
+| `REPLICA_MODE` | `MIN_REPLICAS` | Backend min/max | Frontend min/max | Use when |
+|---|---|---|---|---|
+| `fixed` (default) | `4` (default) | 4 / 4 | 6 / 6 | Standard BASE vs TOPO comparison |
+| `fixed` | `2` | 2 / 2 | 4 / 4 | Lighter run — less resource pressure, faster pod startup |
+| `scale` | `1` (default) | 1 / 4 | 3 / 6 | HPA autoscaling experiment — measures cold-start behaviour |
+| `scale` | `2` | 2 / 4 | 4 / 6 | Autoscaling from a warm floor — avoids cold-start saturation |
+
+In `fixed` mode `MAX_REPLICAS` is always forced equal to `MIN_REPLICAS`, so HPA cannot scale up or down regardless of CPU load.
 
 ```bash
-# Fixed replicas — recommended for BASE vs TOPO comparison
-REPLICA_MODE=fixed MODE=full ./01-run-experiment.sh
+# Standard fixed comparison (4 replicas each service)
+REPLICA_MODE=fixed MIN_REPLICAS=4 MODE=full ./01-run-experiment.sh
 
-# HPA autoscaling — replicas ramp from 1 up to 4
-REPLICA_MODE=scale MODE=full ./01-run-experiment.sh
+# Lighter fixed run (2 replicas — useful for memory-constrained clusters)
+REPLICA_MODE=fixed MIN_REPLICAS=2 MODE=full ./01-run-experiment.sh
+
+# HPA autoscaling from cold (1 → 4)
+REPLICA_MODE=scale MIN_REPLICAS=1 MODE=full ./01-run-experiment.sh
+
+# HPA autoscaling from warm floor (2 → 4)
+REPLICA_MODE=scale MIN_REPLICAS=2 MODE=full ./01-run-experiment.sh
 ```
 
 ### All key variables
 
 | Variable | Default | Effect |
 |---|---|---|
-| `REPLICA_MODE` | `fixed` | `fixed` = pin replicas (no scaling); `scale` = HPA autoscales |
+| `REPLICA_MODE` | `fixed` | `fixed` = pin replicas (no scaling); `scale` = HPA autoscales min→max |
+| `MIN_REPLICAS` | `4` | Fixed replica count (`fixed` mode) or HPA floor (`scale` mode); frontend gets +2 |
+| `MAX_REPLICAS` | `4` | HPA ceiling in `scale` mode; ignored in `fixed` mode (forced = `MIN_REPLICAS`) |
 | `BURST_SEED` | `42` | Random seed for burst plan — same seed = identical plan across runs |
 | `CPU_THRESHOLD` | `75` | HPA CPU target %; lower = more aggressive scaling (only relevant for `scale` mode) |
 | `BURSTS` | `18` | Number of load bursts |

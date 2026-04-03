@@ -30,13 +30,18 @@ SAMPLE_INTERVAL="${SAMPLE_INTERVAL:-8}"
 # Fixed seed so BASE and TOPO runs get identical burst plans.
 # Change only when you want a different (but still reproducible) load profile.
 BURST_SEED="${BURST_SEED:-42}"
-# Replica mode: fixed (min=max=4, no cold-start noise) or scale (min=1, max=4, HPA autoscales).
+# Replica mode: fixed (min=max=MIN_REPLICAS) or scale (min=MIN_REPLICAS, max=MAX_REPLICAS).
 REPLICA_MODE="${REPLICA_MODE:-fixed}"
+# MIN_REPLICAS: fixed replica count in 'fixed' mode, or floor in 'scale' mode.
+#   2 → lighter footprint, lower baseline latency, faster pod startup
+#   4 → stronger steady state, better topo-aware locality (more zone-local candidates)
+MIN_REPLICAS="${MIN_REPLICAS:-4}"
+MAX_REPLICAS="${MAX_REPLICAS:-4}"
 
 echo "========================================"
 echo "Stage1 Experiment Runner"
 echo "========================================"
-echo "MODE=${MODE}  REPLICA_MODE=${REPLICA_MODE}  BURST_SEED=${BURST_SEED}"
+echo "MODE=${MODE}  REPLICA_MODE=${REPLICA_MODE}  MIN_REPLICAS=${MIN_REPLICAS}  BURST_SEED=${BURST_SEED}"
 echo "RUN_ID=${RUN_ID}"
 echo ""
 
@@ -117,6 +122,8 @@ deploy_workload_if_needed() {
 setup_hpa() {
   CPU_THRESHOLD="${CPU_THRESHOLD}" \
   REPLICA_MODE="${REPLICA_MODE}" \
+  MIN_REPLICAS="${MIN_REPLICAS}" \
+  MAX_REPLICAS="${MAX_REPLICAS}" \
     "${ROOT_DIR}/07-setup-hpa.sh"
 }
 
