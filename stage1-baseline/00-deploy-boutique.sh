@@ -104,29 +104,75 @@ teardown() {
   exit 0
 }
 
+# ── node topology zone labels ─────────────────────────────────────────────────
+# topology.kubernetes.io/zone labels are REQUIRED for preferLocalEndpoints to
+# ever become true in OVN-Kubernetes. Without them the feature is silently a no-op.
+#
+# Split: node1+node2+node3 → zone-a   node4+node5 → zone-b
+# (3+2 gives each zone ≥1 replica even at MIN_REPLICAS=2, satisfying the
+#  proportionality guard: proportionalMin = clusterTotal/2 * 0.5)
+ensure_node_zone_labels() {
+  local already
+  already=$($KC get nodes --no-headers \
+    -o custom-columns='Z:.metadata.labels.topology\.kubernetes\.io/zone' \
+    2>/dev/null | grep -vc "^<none>$" || echo "0")
+
+  if [ "${already}" -gt "0" ]; then
+    info "Node zone labels already set — skipping."
+    $KC get nodes -o custom-columns='NAME:.metadata.name,ZONE:.metadata.labels.topology\.kubernetes\.io/zone'
+    return
+  fi
+
+  info "Assigning topology zones to worker nodes (zone-a: node1–3, zone-b: node4–5)..."
+  local node zone
+  while IFS= read -r node; do
+    # Short hostname prefix determines zone: node1/2/3 → zone-a, node4/5 → zone-b
+    local short="${node%%.*}"
+    case "${short}" in
+      node1|node2|node3) zone="zone-a" ;;
+      node4|node5)       zone="zone-b" ;;
+      *)                 zone="zone-a" ;;  # control-plane / unexpected → zone-a
+    esac
+    $KC label node "${node}" topology.kubernetes.io/zone="${zone}" --overwrite
+    info "  ${node} → ${zone}"
+  done < <($KC get nodes --no-headers -o custom-columns='NAME:.metadata.name' | grep -v "^node0\." | sort)
+
+  info "Zone assignment:"
+  $KC get nodes -o custom-columns='NAME:.metadata.name,ZONE:.metadata.labels.topology\.kubernetes\.io/zone'
+}
+
 # ── topo-aware opt-in annotation ─────────────────────────────────────────────
 annotate_topo_services() {
   # Only annotate if OVN_ENABLE_TOPOLOGY_AWARE_LB is set to "true" in the
-  # ovnkube-master deployment, otherwise this is a no-op.
+  # ovnkube-master deployment, otherwise strip the annotation so services revert
+  # to cluster-wide routing (avoids leftover annotations from a prior topo run).
   local topo_enabled
   topo_enabled=$($KC get deployment ovnkube-master -n ovn-kubernetes \
     -o jsonpath='{.spec.template.spec.containers[?(@.name=="ovnkube-master")].env[?(@.name=="OVN_ENABLE_TOPOLOGY_AWARE_LB")].value}' \
     2>/dev/null || echo "false")
 
+  local svcs=(frontend productcatalogservice cartservice checkoutservice
+              currencyservice recommendationservice paymentservice
+              shippingservice emailservice adservice)
+
   if [[ "${topo_enabled}" == "true" ]]; then
-    info "Topology-aware LB is enabled — annotating services with topology-mode: Auto..."
-    for svc in frontend productcatalogservice cartservice checkoutservice \
-               currencyservice recommendationservice paymentservice \
-               shippingservice emailservice adservice; do
+    info "Topology-aware LB enabled — annotating services with topology-mode: Auto..."
+    for svc in "${svcs[@]}"; do
       $KC annotate service "${svc}" \
         service.kubernetes.io/topology-mode=Auto \
         --overwrite 2>/dev/null || true
     done
-    info "Service annotations applied:"
-    $KC get services -o custom-columns='NAME:.metadata.name,TOPO:.metadata.annotations.service\.kubernetes\.io/topology-mode'
   else
-    info "Topology-aware LB not enabled (OVN_ENABLE_TOPOLOGY_AWARE_LB != true) — skipping service annotations."
+    info "Topology-aware LB not enabled — removing topology-mode annotation from services (if present)..."
+    for svc in "${svcs[@]}"; do
+      $KC annotate service "${svc}" \
+        service.kubernetes.io/topology-mode- \
+        2>/dev/null || true
+    done
   fi
+
+  info "Service topology annotations:"
+  $KC get services -o custom-columns='NAME:.metadata.name,TOPO:.metadata.annotations.service\.kubernetes\.io/topology-mode'
 }
 
 # ── main ─────────────────────────────────────────────────────────────────────
@@ -143,6 +189,7 @@ echo "========================================"
 
 ensure_cluster
 approve_csrs
+ensure_node_zone_labels
 ensure_metrics_server
 deploy_boutique
 
