@@ -23,8 +23,8 @@ BURSTS="${BURSTS:-18}"
 BASE_BURST_SECONDS="${BASE_BURST_SECONDS:-90}"
 MAX_BURST_SECONDS="${MAX_BURST_SECONDS:-180}"
 MAX_SLEEP_SECONDS="${MAX_SLEEP_SECONDS:-5}"
-QPS_FLOOR="${QPS_FLOOR:-100}"
-QPS_CEIL="${QPS_CEIL:-750}"
+QPS_FLOOR="${QPS_FLOOR:-80}"   # floor for heavy_tail bursts  (~100% efficiency)
+QPS_CEIL="${QPS_CEIL:-350}"   # spike ceiling (~85% of cluster max ~300–320 req/s)
 THREADS_PER_ENDPOINT="${THREADS_PER_ENDPOINT:-10}"
 SAMPLE_INTERVAL="${SAMPLE_INTERVAL:-8}"
 # Fixed seed so BASE and TOPO runs get identical burst plans.

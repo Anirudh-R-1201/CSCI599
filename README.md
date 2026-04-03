@@ -108,6 +108,15 @@ kubectl get pods -A
 
 ---
 
+
+### Step 4.1: Traceroutes to find locatlity
+```bash
+traceroute -n node1.599test.csci599-pg0.utah.cloudlab.us
+traceroute -n node2.599test.csci599-pg0.utah.cloudlab.us
+traceroute -n node3.599test.csci599-pg0.utah.cloudlab.us
+traceroute -n node4.599test.csci599-pg0.utah.cloudlab.us
+traceroute -n node5.599test.csci599-pg0.utah.cloudlab.us
+```
 ### Step 5: Fix DNS Permanently (ALL Nodes) - CRITICAL
 
 **CloudLab Issue:** systemd-resolved often fails on CloudLab, causing DNS resolution to break. This prevents image pulls and API server access.
@@ -210,7 +219,7 @@ export PATH="$HOME/.local/bin:$PATH"
 echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.profile
 ```
 
-**[BASE only]** Also install Go for compiling on node0:
+**[Both version]** Also install Go for compiling on node0:
 
 ```bash
 curl -LO https://go.dev/dl/go1.21.7.linux-amd64.tar.gz
@@ -244,7 +253,7 @@ grep "apply --validate=false" dist/images/ovnkube.sh  # verify
 
 ### Step 3: Build or obtain the OVN-Kubernetes image
 
-**[BASE] Build on node0 (~15 minutes):**
+** Build on node0 (~15 minutes):**
 
 ```bash
 cd ~/ovn-kubernetes/dist/images
@@ -349,6 +358,8 @@ sleep 10
 ```bash
 kubectl get csr -o name | xargs kubectl certificate approve
 kubectl get csr   # all should show Approved,Issued
+# or run
+while true; do sleep 2 && kubectl get csr -o name | xargs kubectl certificate approve 2>/dev/null; done
 ```
 
 **Recommended: set up automatic approval so you never need to do this again:**
@@ -471,10 +482,10 @@ ovs-node          1/1     Running   0  (one per node)
 # Assign zones (adjust grouping based on measured RTT)
 # recheck node names from kubectl get nodes -o wide
 kubectl label node node1.599test.csci599-pg0.utah.cloudlab.us topology.kubernetes.io/zone=zone-a
-kubectl label node node2.599test.csci599-pg0.utah.cloudlab.us topology.kubernetes.io/zone=zone-b
+kubectl label node node2.599test.csci599-pg0.utah.cloudlab.us topology.kubernetes.io/zone=zone-a
 kubectl label node node3.599test.csci599-pg0.utah.cloudlab.us topology.kubernetes.io/zone=zone-b
-kubectl label node node4.599test.csci599-pg0.utah.cloudlab.us topology.kubernetes.io/zone=zone-a #b
-kubectl label node node5.599test.csci599-pg0.utah.cloudlab.us topology.kubernetes.io/zone=zone-c #a
+kubectl label node node4.599test.csci599-pg0.utah.cloudlab.us topology.kubernetes.io/zone=zone-b 
+kubectl label node node5.599test.csci599-pg0.utah.cloudlab.us topology.kubernetes.io/zone=zone-c 
 kubectl get nodes --show-labels | grep topology
 ```
 
