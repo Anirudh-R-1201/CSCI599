@@ -52,7 +52,10 @@ ensure_cluster() {
   fi
 
   # Block if any nodes are NotReady
-  NOT_READY=$(kubectl --kubeconfig "${KUBECONFIG_PATH}" get nodes --no-headers | grep -v " Ready" | wc -l || echo "0")
+  # Use subshell around grep so pipefail doesn't trigger when all nodes are Ready
+  NOT_READY=$(kubectl --kubeconfig "${KUBECONFIG_PATH}" get nodes --no-headers \
+    | (grep -v " Ready" || true) | wc -l | tr -d '[:space:]')
+  NOT_READY="${NOT_READY:-0}"
   if [ "${NOT_READY}" -gt 0 ]; then
     echo "Error: ${NOT_READY} node(s) are not Ready. Fix before running experiment:"
     kubectl --kubeconfig "${KUBECONFIG_PATH}" get nodes
@@ -61,7 +64,8 @@ ensure_cluster() {
 
   # Block if ovnkube-node pods are not all healthy
   UNHEALTHY_OVN=$(kubectl --kubeconfig "${KUBECONFIG_PATH}" -n ovn-kubernetes get pods -l app=ovnkube-node --no-headers 2>/dev/null \
-    | grep -v "Running" | wc -l || echo "0")
+    | (grep -v "Running" || true) | wc -l | tr -d '[:space:]')
+  UNHEALTHY_OVN="${UNHEALTHY_OVN:-0}"
   if [ "${UNHEALTHY_OVN}" -gt 0 ]; then
     echo "Error: ${UNHEALTHY_OVN} ovnkube-node pod(s) not Running. Approve pending CSRs first:"
     echo "  kubectl get csr | grep Pending | awk '{print \$1}' | xargs kubectl certificate approve"

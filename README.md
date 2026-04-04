@@ -483,9 +483,9 @@ ovs-node          1/1     Running   0  (one per node)
 # recheck node names from kubectl get nodes -o wide
 kubectl label node node1.599test.csci599-pg0.utah.cloudlab.us topology.kubernetes.io/zone=zone-a
 kubectl label node node2.599test.csci599-pg0.utah.cloudlab.us topology.kubernetes.io/zone=zone-a
-kubectl label node node3.599test.csci599-pg0.utah.cloudlab.us topology.kubernetes.io/zone=zone-b
+kubectl label node node3.599test.csci599-pg0.utah.cloudlab.us topology.kubernetes.io/zone=zone-a
 kubectl label node node4.599test.csci599-pg0.utah.cloudlab.us topology.kubernetes.io/zone=zone-b 
-kubectl label node node5.599test.csci599-pg0.utah.cloudlab.us topology.kubernetes.io/zone=zone-c 
+kubectl label node node5.599test.csci599-pg0.utah.cloudlab.us topology.kubernetes.io/zone=zone-b 
 kubectl get nodes --show-labels | grep topology
 ```
 

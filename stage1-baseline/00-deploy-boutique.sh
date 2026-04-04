@@ -112,30 +112,48 @@ teardown() {
 # (3+2 gives each zone ≥1 replica even at MIN_REPLICAS=2, satisfying the
 #  proportionality guard: proportionalMin = clusterTotal/2 * 0.5)
 ensure_node_zone_labels() {
-  local already
-  already=$($KC get nodes --no-headers \
-    -o custom-columns='Z:.metadata.labels.topology\.kubernetes\.io/zone' \
-    2>/dev/null | grep -vc "^<none>$" || echo "0")
+  # Always re-apply zone labels so this is idempotent on re-runs.
+  # node0 (control plane + load generators) intentionally has NO zone label so
+  # OVN topology-aware routing falls back to cluster-wide endpoints for it —
+  # preventing all k6/fortio traffic from being pinned to one zone's pods.
+  # 3-zone layout (derived from traceroute hop counts between nodes):
+  #   zone-a: node1, node2   (closest pair)
+  #   zone-b: node3, node4   (second hop group)
+  #   zone-c: node5          (most distant node)
+  # node0 intentionally left unlabeled so load generators get cluster-wide routing.
+  info "Assigning topology zones to worker nodes (zone-a: node1–2, zone-b: node3–4, zone-c: node5)..."
 
-  if [ "${already}" -gt "0" ]; then
-    info "Node zone labels already set — skipping."
-    $KC get nodes -o custom-columns='NAME:.metadata.name,ZONE:.metadata.labels.topology\.kubernetes\.io/zone'
-    return
-  fi
-
-  info "Assigning topology zones to worker nodes (zone-a: node1–3, zone-b: node4–5)..."
+  # ── Assign zones to worker nodes ─────────────────────────────────────────────
   local node zone
   while IFS= read -r node; do
-    # Short hostname prefix determines zone: node1/2/3 → zone-a, node4/5 → zone-b
     local short="${node%%.*}"
     case "${short}" in
-      node1|node2|node3) zone="zone-a" ;;
-      node4|node5)       zone="zone-b" ;;
-      *)                 zone="zone-a" ;;  # control-plane / unexpected → zone-a
+      node1|node2) zone="zone-a" ;;
+      node3|node4) zone="zone-b" ;;
+      node5)       zone="zone-c" ;;
+      *)           zone="zone-a" ;;
     esac
     $KC label node "${node}" topology.kubernetes.io/zone="${zone}" --overwrite
     info "  ${node} → ${zone}"
   done < <($KC get nodes --no-headers -o custom-columns='NAME:.metadata.name' | grep -v "^node0\." | sort)
+
+  # ── Explicitly remove zone label from node0 ────────────────────────────────
+  # node0 must be zone-free: if it has a stale zone-a label from a prior run,
+  # topology-aware routing would restrict all load-generator traffic to zone-a
+  # pods only, halving effective frontend capacity and saturating that zone.
+  local node0
+  node0=$($KC get nodes --no-headers -o custom-columns='NAME:.metadata.name' | grep "^node0\." | head -1)
+  if [ -n "${node0}" ]; then
+    local cur_zone
+    cur_zone=$($KC get node "${node0}" \
+      -o jsonpath='{.metadata.labels.topology\.kubernetes\.io/zone}' 2>/dev/null || echo "")
+    if [ -n "${cur_zone}" ]; then
+      $KC label node "${node0}" topology.kubernetes.io/zone- 2>/dev/null || true
+      info "  ${node0} → (zone label removed — will use cluster-wide routing)"
+    else
+      info "  ${node0} → (no zone label — cluster-wide routing confirmed)"
+    fi
+  fi
 
   info "Zone assignment:"
   $KC get nodes -o custom-columns='NAME:.metadata.name,ZONE:.metadata.labels.topology\.kubernetes\.io/zone'
