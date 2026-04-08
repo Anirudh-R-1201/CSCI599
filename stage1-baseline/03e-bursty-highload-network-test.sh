@@ -24,8 +24,8 @@ BASE_BURST_SECONDS="${BASE_BURST_SECONDS:-45}"
 MAX_BURST_SECONDS="${MAX_BURST_SECONDS:-90}"
 MIN_SLEEP_SECONDS="${MIN_SLEEP_SECONDS:-45}"
 MAX_SLEEP_SECONDS="${MAX_SLEEP_SECONDS:-120}"
-QPS_FLOOR="${QPS_FLOOR:-80}"   # floor for heavy_tail bursts
-QPS_CEIL="${QPS_CEIL:-350}"   # spike ceiling
+QPS_FLOOR="${QPS_FLOOR:-25}"   # floor for heavy_tail bursts
+QPS_CEIL="${QPS_CEIL:-100}"   # spike ceiling
 SPIKE_PROBABILITY="${SPIKE_PROBABILITY:-0.35}"
 # Fixed seed guarantees identical burst plans across BASE and TOPO runs.
 # Override with BURST_SEED=<n> to generate a different (but still reproducible) plan.

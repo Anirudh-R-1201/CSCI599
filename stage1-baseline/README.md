@@ -24,9 +24,26 @@ cd ~/CSCI599/stage1-baseline
 # Step 1: Deploy Online Boutique (one-time, idempotent)
 ./00-deploy-boutique.sh
 
+### Pre-flight cleanup (run once before any experiment)
+
+```bash
+# Remove stale pods and HPAs
+kubectl delete pod --field-selector=status.phase=Failed -n default
+kubectl delete hpa --all
+
+# Scale everything to 1 so the experiment's HPA setup starts from a clean slate
+kubectl scale deployment productcatalogservice recommendationservice \
+  checkoutservice cartservice --replicas=1
+kubectl scale deployment frontend cartservice --replicas=3
+kubectl wait --for=condition=available \
+  deployment/frontend deployment/productcatalogservice \
+  deployment/recommendationservice deployment/checkoutservice deployment/cartservice \
+  --timeout=60s
+```
+
 # Step 2: Run experiment
 REPLICA_MODE=fixed MIN_REPLICAS=4 MODE=full ./01-run-experiment.sh && ./02-analyze-results.sh
-
+OVN_ENABLE_TOPOLOGY_AWARE_LB=true REPLICA_MODE=scale MIN_REPLICAS=1 MODE=full ./01-run-experiment.sh && ./02-analyze-results.sh
 # Approve CSRs in background (required on CloudLab)
 while true; do sleep 2 && kubectl get csr -o name | xargs kubectl certificate approve 2>/dev/null; done
 ```
@@ -37,21 +54,7 @@ while true; do sleep 2 && kubectl get csr -o name | xargs kubectl certificate ap
 the only difference between BASE and TOPO runs is the LB routing policy. `BURST_SEED=42`
 (default) guarantees both runs see the exact same burst plan.
 
-### Pre-flight cleanup (run once before any experiment)
 
-```bash
-# Remove stale pods and HPAs
-kubectl delete pod --field-selector=status.phase=Failed -n default
-kubectl delete hpa --all
-
-# Scale everything to 1 so the experiment's HPA setup starts from a clean slate
-kubectl scale deployment frontend productcatalogservice recommendationservice \
-  checkoutservice cartservice --replicas=1
-kubectl wait --for=condition=available \
-  deployment/frontend deployment/productcatalogservice \
-  deployment/recommendationservice deployment/checkoutservice deployment/cartservice \
-  --timeout=60s
-```
 
 ```bash
 # Free disk space on all worker nodes (run if a node is >85% full)
@@ -93,21 +96,44 @@ kubectl set env deployment/ovnkube-master -n ovn-kubernetes \
 kubectl rollout restart deployment/ovnkube-master -n ovn-kubernetes
 kubectl rollout status deployment/ovnkube-master -n ovn-kubernetes --timeout=120s
 
-# Verify topology-aware LBs are active
+# Re-apply topology-mode annotation so ovnkube-master creates per-node LBs
+for svc in frontend productcatalogservice cartservice checkoutservice \
+           currencyservice recommendationservice paymentservice \
+           shippingservice emailservice adservice; do
+  kubectl annotate svc ${svc} service.kubernetes.io/topology-mode=Auto --overwrite
+done
+sleep 15  # wait for ovnkube-master reconciliation
+
+# Verify topo-aware per-node LBs exist (should print 5 per topology-annotated service)
 DB_POD=$(kubectl get pod -n ovn-kubernetes -l name=ovnkube-db -o jsonpath='{.items[0].metadata.name}')
 kubectl exec -n ovn-kubernetes "$DB_POD" -- \
-  ovn-nbctl list load_balancer | grep "selection_fields" | sort | uniq -c
-# Expected: some entries show [ip_dst, ip_src]  ← topology-aware
-#           others show []                       ← regular (kube-system services)
+  ovn-nbctl --columns=name find load_balancer 2>/dev/null \
+  | grep "^name" | grep "node_switch" | grep -v "template\|merged" | wc -l
+# Expected: ≥ 25 (5 per-node LBs × ≥5 topology-annotated services)
+
+# Verify backend-set diversity for frontend (proves zone-local routing is active):
+# Different nodes should map the frontend ClusterIP to DIFFERENT backend pod IPs.
+# All-same IPs = topo-aware not working; different IPs per LB = working correctly.
+kubectl exec -n ovn-kubernetes "$DB_POD" -- ovn-nbctl lb-list 2>/dev/null \
+  | awk -v clusterip="$(kubectl get svc frontend -o jsonpath='{.spec.clusterIP}')" \
+    '$3==clusterip":80" {print NF, $0}' \
+  | sort | uniq -c
+# Expected: multiple lines with DIFFERENT backend IP sets (node-local or zone-local per node)
+# node0 (no zone label) → cluster-wide (all 6 IPs)
+# node1–5 → 1–2 IPs each (node-local tier, since every worker has ≥1 frontend pod)
 
 kubectl delete pod k6-loadgen --ignore-not-found
 kubectl apply -f k6-loadgen.yaml
 kubectl wait --for=condition=Ready pod/k6-loadgen --timeout=60s
 
 # Run — same REPLICA_MODE and BURST_SEED as baseline for apples-to-apples comparison
-REPLICA_MODE=fixed MODE=full ./01-run-experiment.sh && ./02-analyze-results.sh
+REPLICA_MODE=fixed MIN_REPLICAS=4 BURST_SEED=42 MODE=full ./01-run-experiment.sh && ./02-analyze-results.sh
 # Note the RUN_ID printed — this is your topo-aware run
 ```
+
+> **Note on `selection_fields`:** All LBs correctly show `selection_fields: []` in both BASE and TOPO
+> mode. Topology enforcement is in the **per-node backend list** (different pod IPs per node), not
+> in the hash function. Do not use `selection_fields` as a health check for topo-aware routing.
 
 ### What to compare (replace `<BASE>` and `<TOPO>` with actual RUN_IDs)
 

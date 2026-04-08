@@ -148,51 +148,6 @@ sudo chattr +i /etc/resolv.conf
 nslookup google.com
 ```
 
-**From node0, fix all nodes at once:**
-
-```bash
-# Fix node0 (local)
-sudo systemctl stop systemd-resolved
-sudo systemctl disable systemd-resolved
-sudo rm -f /etc/resolv.conf
-sudo bash -c 'cat > /etc/resolv.conf << EOF
-nameserver 8.8.8.8
-nameserver 8.8.4.4
-nameserver 1.1.1.1
-search utah.cloudlab.us
-EOF'
-sudo chattr +i /etc/resolv.conf
-
-# Fix node1
-ssh node1 "sudo systemctl stop systemd-resolved && \
-           sudo systemctl disable systemd-resolved && \
-           sudo rm -f /etc/resolv.conf && \
-           sudo bash -c 'cat > /etc/resolv.conf << EOF
-nameserver 8.8.8.8
-nameserver 8.8.4.4
-nameserver 1.1.1.1
-search utah.cloudlab.us
-EOF' && \
-           sudo chattr +i /etc/resolv.conf"
-
-# Fix node2
-ssh node2 "sudo systemctl stop systemd-resolved && \
-           sudo systemctl disable systemd-resolved && \
-           sudo rm -f /etc/resolv.conf && \
-           sudo bash -c 'cat > /etc/resolv.conf << EOF
-nameserver 8.8.8.8
-nameserver 8.8.4.4
-nameserver 1.1.1.1
-search utah.cloudlab.us
-EOF' && \
-           sudo chattr +i /etc/resolv.conf"
-
-# Verify DNS on all nodes
-nslookup github.com
-ssh node1 "nslookup github.com"
-ssh node2 "nslookup github.com"
-```
-
 **Why this is important:**
 - Without working DNS, container image pulls will fail
 - OVN pods won't be able to reach the Kubernetes API server
@@ -271,7 +226,7 @@ docker save ovn-kube:latest -o ~/ovn-kube.tar
 
 ```bash
 
-# Do on each node
+# Do on each node once distributed
 sudo ctr -n k8s.io image import ~/ovn-kube.tar 
 sudo ctr -n k8s.io image ls | grep ovn-kube
 ```
@@ -506,16 +461,6 @@ for svc in frontend productcatalogservice cartservice checkoutservice \
 done
 
 kubectl get services -o custom-columns='NAME:.metadata.name,TOPO:.metadata.annotations.service\.kubernetes\.io/topology-mode'
-```
-
-**Verify topology-aware LBs are created:**
-
-```bash
-DB_POD=$(kubectl get pod -n ovn-kubernetes -l name=ovnkube-db -o jsonpath='{.items[0].metadata.name}')
-kubectl exec -n ovn-kubernetes $DB_POD -- \
-  ovn-nbctl list load_balancer | grep "selection_fields" | sort | uniq -c
-# Topology-aware LBs: selection_fields : ["ip_src", "ip_dst"]
-# Regular LBs:        selection_fields : []
 ```
 
 **Toggle the feature on a live cluster without rebuilding:**
