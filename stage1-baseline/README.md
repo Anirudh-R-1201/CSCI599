@@ -34,16 +34,46 @@ kubectl delete hpa --all
 # Scale everything to 1 so the experiment's HPA setup starts from a clean slate
 kubectl scale deployment productcatalogservice recommendationservice \
   checkoutservice cartservice --replicas=1
-kubectl scale deployment frontend cartservice --replicas=3
+kubectl scale deployment frontend currencyservice --replicas=3
 kubectl wait --for=condition=available \
   deployment/frontend deployment/productcatalogservice \
   deployment/recommendationservice deployment/checkoutservice deployment/cartservice \
   --timeout=60s
 ```
-
+```bash
 # Step 2: Run experiment
+## Fixed replicas 
 REPLICA_MODE=fixed MIN_REPLICAS=4 MODE=full ./01-run-experiment.sh && ./02-analyze-results.sh
-OVN_ENABLE_TOPOLOGY_AWARE_LB=true REPLICA_MODE=scale MIN_REPLICAS=1 MODE=full ./01-run-experiment.sh && ./02-analyze-results.sh
+```
+
+```bash
+
+# Scale replicas
+# Re-apply topology-mode annotation so ovnkube-master creates per-node LBs
+for svc in frontend productcatalogservice cartservice checkoutservice \
+           currencyservice recommendationservice paymentservice \
+           shippingservice emailservice adservice; do
+  kubectl annotate svc ${svc} service.kubernetes.io/topology-mode=Auto --overwrite
+done
+sleep 15  # wait for ovnkube-master reconciliation
+
+# Verify topo-aware per-node LBs exist (should print 5 per topology-annotated service)
+DB_POD=$(kubectl get pod -n ovn-kubernetes -l name=ovnkube-db -o jsonpath='{.items[0].metadata.name}')
+kubectl exec -n ovn-kubernetes "$DB_POD" -- \
+  ovn-nbctl --columns=name find load_balancer 2>/dev/null \
+  | grep "^name" | grep "node_switch" | grep -v "template\|merged" | wc -l
+# Expected: ≥ 25 (5 per-node LBs × ≥5 topology-annotated services)
+
+# Verify backend-set diversity for frontend (proves zone-local routing is active):
+# Different nodes should map the frontend ClusterIP to DIFFERENT backend pod IPs.
+# All-same IPs = topo-aware not working; different IPs per LB = working correctly.
+kubectl exec -n ovn-kubernetes "$DB_POD" -- ovn-nbctl lb-list 2>/dev/null \
+  | awk -v clusterip="$(kubectl get svc frontend -o jsonpath='{.spec.clusterIP}')" \
+    '$4==clusterip":80" {print NF, $0}' \
+  | sort | uniq -c
+# Expected: multiple lines with DIFFERENT backend IP sets (node-local or zone-local per node)
+
+REPLICA_MODE=scale MIN_REPLICAS=1 MODE=full ./01-run-experiment.sh && ./02-analyze-results.sh
 # Approve CSRs in background (required on CloudLab)
 while true; do sleep 2 && kubectl get csr -o name | xargs kubectl certificate approve 2>/dev/null; done
 ```
@@ -116,7 +146,7 @@ kubectl exec -n ovn-kubernetes "$DB_POD" -- \
 # All-same IPs = topo-aware not working; different IPs per LB = working correctly.
 kubectl exec -n ovn-kubernetes "$DB_POD" -- ovn-nbctl lb-list 2>/dev/null \
   | awk -v clusterip="$(kubectl get svc frontend -o jsonpath='{.spec.clusterIP}')" \
-    '$3==clusterip":80" {print NF, $0}' \
+    '$4==clusterip":80" {print NF, $0}' \
   | sort | uniq -c
 # Expected: multiple lines with DIFFERENT backend IP sets (node-local or zone-local per node)
 # node0 (no zone label) → cluster-wide (all 6 IPs)
