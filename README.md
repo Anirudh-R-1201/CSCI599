@@ -52,7 +52,7 @@ newgrp docker
 **Merged cmd**
 
 ```bash
-git clone https://github.com/Anirudh-R-1201/CSCI599.git && cd CSCI599 && chmod +x *.sh && ./all.sh && newgrp docker
+git clone https://github.com/Anirudh-R-1201/CSCI599.git && cd CSCI599 && chmod +x *.sh && ./all.sh && sleep 10 && newgrp docker
 ```
 
 ---
