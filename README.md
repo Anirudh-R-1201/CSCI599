@@ -276,7 +276,24 @@ grep "TOPOLOGY_AWARE" ../yaml/ovnkube-master.yaml
 
 ---
 
-### Step 7: Deploy OVN-Kubernetes (node0)
+### Step 7: Approve Certificate Signing Requests (node0, seperate terminal)
+
+**CRITICAL:** OVN pods request certificates that must be manually approved the first time.
+
+```bash
+kubectl get csr -o name | xargs kubectl certificate approve
+kubectl get csr   # all should show Approved,Issued
+# or run
+while true; do sleep 2 && kubectl get csr -o name | xargs kubectl certificate approve 2>/dev/null; done
+```
+
+---
+
+---
+
+### Step 8: Deploy OVN-Kubernetes (node0)
+
+
 
 ```bash
 cd ~/ovn-kubernetes
@@ -303,84 +320,37 @@ kubectl apply -f dist/yaml/ovnkube-master.yaml
 kubectl apply -f dist/yaml/ovnkube-node.yaml
 sleep 10
 ```
-
----
-
-### Step 8: Approve Certificate Signing Requests (node0)
-
-**CRITICAL:** OVN pods request certificates that must be manually approved the first time.
+### If there are errors run 
 
 ```bash
-kubectl get csr -o name | xargs kubectl certificate approve
-kubectl get csr   # all should show Approved,Issued
-# or run
-while true; do sleep 2 && kubectl get csr -o name | xargs kubectl certificate approve 2>/dev/null; done
+TARBALL=$(ls ~/ovn-kube*.tar 2>/dev/null | head -1)
+echo "Using tarball: ${TARBALL}"
+# Import on node0 itself first
+sudo ctr -n k8s.io images import ${TARBALL}
+sudo ctr -n k8s.io images tag docker.io/library/ovn-kube:latest docker.io/library/ovn-kube-topo:latest 2>/dev/null || true
+# Distribute and import on all workers in parallel
+for node in node1 node2 node3; do
+  (
+    scp -o StrictHostKeyChecking=no ${TARBALL} ${node}:~/ovn-kube.tar
+    ssh -o StrictHostKeyChecking=no ${node} "
+      sudo ctr -n k8s.io images import ~/ovn-kube.tar
+      sudo ctr -n k8s.io images tag docker.io/library/ovn-kube:latest docker.io/library/ovn-kube-topo:latest 2>/dev/null || true
+      echo '${node}: done'
+    "
+  ) &
+done
+wait
+echo "All nodes loaded"
+# ── Delete stuck pods so they retry with local image
+kubectl delete pod -n ovn-kubernetes \
+  $(kubectl get pods -n ovn-kubernetes --no-headers \
+    | awk '/ErrImagePull|ImagePullBackOff/{print $1}' | tr '\n' ' ')
+kubectl get pods -n ovn-kubernetes -w
+
+
+
 ```
 
-**Recommended: set up automatic approval so you never need to do this again:**
-
-```bash
-cat <<EOF | kubectl apply -f -
-apiVersion: v1
-kind: ServiceAccount
-metadata:
-  name: csr-approver
-  namespace: kube-system
----
-apiVersion: rbac.authorization.k8s.io/v1
-kind: ClusterRoleBinding
-metadata:
-  name: csr-approver
-roleRef:
-  apiGroup: rbac.authorization.k8s.io
-  kind: ClusterRole
-  name: system:certificates.k8s.io:certificatesigningrequests:nodeclient
-subjects:
-- kind: ServiceAccount
-  name: csr-approver
-  namespace: kube-system
----
-apiVersion: rbac.authorization.k8s.io/v1
-kind: ClusterRoleBinding
-metadata:
-  name: csr-approver-approve
-roleRef:
-  apiGroup: rbac.authorization.k8s.io
-  kind: ClusterRole
-  name: system:certificates.k8s.io:certificatesigningrequests:selfnodeclient
-subjects:
-- kind: ServiceAccount
-  name: csr-approver
-  namespace: kube-system
----
-apiVersion: batch/v1
-kind: CronJob
-metadata:
-  name: csr-approver
-  namespace: kube-system
-spec:
-  schedule: "*/1 * * * *"
-  successfulJobsHistoryLimit: 1
-  failedJobsHistoryLimit: 1
-  jobTemplate:
-    spec:
-      template:
-        spec:
-          serviceAccountName: csr-approver
-          restartPolicy: OnFailure
-          containers:
-          - name: approver
-            image: bitnami/kubectl:latest
-            command: ["/bin/sh", "-c"]
-            args:
-            - |
-              kubectl get csr -o json | \
-              jq -r '.items[] | select(.status.conditions == null) | .metadata.name' | \
-              xargs -r kubectl certificate approve
-EOF
-```
-
----
 
 ### Step 9: Restart services on worker nodes (node1, node2...)
 
